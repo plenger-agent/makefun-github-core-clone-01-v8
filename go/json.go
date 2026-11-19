@@ -1,14 +1,16 @@
-// A tiny JSON engine: one value type, a parser for request bodies and a
-// marshaller for responses. The forge never imports encoding/json: the
-// standard library's decoder is general-purpose machinery this server does
-// not need, and leaving it out keeps the static binary comfortably under
-// the entry's 8 MiB per-file cap.
+// The forge's private JSON engine: it parses the bodies clients send
+// and renders the replies it returns, with no encoding/json anywhere
+// in the binary. The standard decoder is built for every shape JSON can
+// take; this server only ever meets a narrow slice of it, and skipping
+// the general machinery keeps the static binary well inside the
+// entry's 8 MiB per-file allowance.
 //
-// Values are plain Go values: nil, bool, float64 (numbers), string,
-// []any, map[string]any. Object key order on output follows insertion
-// order for the ordered object type below; plain maps marshal with their
-// keys sorted, which is deterministic and fine for the surfaces that use
-// them (GraphQL and MCP build ordered objects explicitly).
+// One value model throughout: nil, bool, float64 for every number,
+// string, []any and map[string]any. When a reply's key order matters
+// the ordered object type below carries it; plain maps render with
+// sorted keys, which is stable across runs and good enough for the
+// surfaces that build plain maps (the GraphQL and MCP layers assemble
+// ordered objects where order is visible).
 
 package main
 
@@ -17,411 +19,436 @@ import (
 	"strings"
 )
 
-// JObj is an object whose keys marshal in insertion order.
-type JObj struct {
-	Keys []string
-	Vals map[string]any
+// OrderedJSON is a JSON object that remembers the order its keys were
+// first set, and renders them in that order.
+type OrderedJSON struct {
+	Order  []string
+	Values map[string]any
 }
 
-func NewJObj() *JObj { return &JObj{Vals: map[string]any{}} }
+func NewOrderedJSON() *OrderedJSON {
+	return &OrderedJSON{Values: map[string]any{}}
+}
 
-func (o *JObj) Set(key string, val any) *JObj {
-	if _, ok := o.Vals[key]; !ok {
-		o.Keys = append(o.Keys, key)
+// Put stores val under key, appending the key to the render order the
+// first time it appears. It returns the object so calls can chain.
+func (o *OrderedJSON) Put(key string, val any) *OrderedJSON {
+	if _, seen := o.Values[key]; !seen {
+		o.Order = append(o.Order, key)
 	}
-	o.Vals[key] = val
+	o.Values[key] = val
 	return o
 }
 
-func (o *JObj) Get(key string) (any, bool) {
-	v, ok := o.Vals[key]
-	return v, ok
+// Lookup fetches the value stored under key.
+func (o *OrderedJSON) Lookup(key string) (any, bool) {
+	val, seen := o.Values[key]
+	return val, seen
 }
 
 // ---------------------------------------------------------------------------
-// Marshalling
+// Rendering values to text
 // ---------------------------------------------------------------------------
 
-// Escape a string as a JSON string literal, fast when nothing needs
-// escaping (the common case for names, titles and ids).
-func jsonQuote(s string) string {
-	need := false
+const hexAlphabet = "0123456789abcdef"
+
+// quoteJSONString renders s as a JSON string literal. Most strings the
+// forge emits (names, titles, ids) need no escaping at all, and the
+// scan for that case runs first so they cost one pass and a concat.
+func quoteJSONString(s string) string {
+	plain := true
 	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == '"' || c == '\\' {
-			need = true
+		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
+			plain = false
 			break
 		}
 	}
-	if !need {
+	if plain {
 		return `"` + s + `"`
 	}
-	var b strings.Builder
-	b.Grow(len(s) + 2)
-	b.WriteByte('"')
+	var out strings.Builder
+	out.Grow(len(s) + 2)
+	out.WriteByte('"')
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch c {
 		case '"':
-			b.WriteString(`\"`)
+			out.WriteString(`\"`)
 		case '\\':
-			b.WriteString(`\\`)
+			out.WriteString(`\\`)
 		case '\n':
-			b.WriteString(`\n`)
+			out.WriteString(`\n`)
 		case '\r':
-			b.WriteString(`\r`)
+			out.WriteString(`\r`)
 		case '\t':
-			b.WriteString(`\t`)
+			out.WriteString(`\t`)
 		default:
-			if c < 0x20 {
-				b.WriteString(`\u00`)
-				b.WriteByte("0123456789abcdef"[c>>4])
-				b.WriteByte("0123456789abcdef"[c&0xf])
+			if c >= 0x20 {
+				out.WriteByte(c)
 			} else {
-				b.WriteByte(c)
+				out.WriteString(`\u00`)
+				out.WriteByte(hexAlphabet[c>>4])
+				out.WriteByte(hexAlphabet[c&0xf])
 			}
 		}
 	}
-	b.WriteByte('"')
-	return b.String()
+	out.WriteByte('"')
+	return out.String()
 }
 
-func marshalInto(b *strings.Builder, v any) {
-	switch t := v.(type) {
+// renderValueInto appends the compact JSON form of v to out.
+func renderValueInto(out *strings.Builder, v any) {
+	switch node := v.(type) {
 	case nil:
-		b.WriteString("null")
+		out.WriteString("null")
 	case bool:
-		if t {
-			b.WriteString("true")
+		if node {
+			out.WriteString("true")
 		} else {
-			b.WriteString("false")
+			out.WriteString("false")
 		}
 	case string:
-		b.WriteString(jsonQuote(t))
+		out.WriteString(quoteJSONString(node))
 	case int:
-		b.WriteString(strconv.Itoa(t))
+		out.WriteString(strconv.Itoa(node))
 	case int64:
-		b.WriteString(strconv.FormatInt(t, 10))
+		out.WriteString(strconv.FormatInt(node, 10))
 	case float64:
-		b.WriteString(strconv.FormatFloat(t, 'g', -1, 64))
+		out.WriteString(strconv.FormatFloat(node, 'g', -1, 64))
 	case []any:
-		b.WriteByte('[')
-		for i, e := range t {
-			if i > 0 {
-				b.WriteByte(',')
+		out.WriteByte('[')
+		for idx, item := range node {
+			if idx > 0 {
+				out.WriteByte(',')
 			}
-			marshalInto(b, e)
+			renderValueInto(out, item)
 		}
-		b.WriteByte(']')
+		out.WriteByte(']')
 	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
+		names := make([]string, 0, len(node))
+		for name := range node {
+			names = append(names, name)
 		}
-		sortStrings(keys)
-		b.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				b.WriteByte(',')
+		sortLexical(names)
+		out.WriteByte('{')
+		for idx, name := range names {
+			if idx > 0 {
+				out.WriteByte(',')
 			}
-			b.WriteString(jsonQuote(k))
-			b.WriteByte(':')
-			marshalInto(b, t[k])
+			out.WriteString(quoteJSONString(name))
+			out.WriteByte(':')
+			renderValueInto(out, node[name])
 		}
-		b.WriteByte('}')
-	case *JObj:
-		b.WriteByte('{')
-		for i, k := range t.Keys {
-			if i > 0 {
-				b.WriteByte(',')
+		out.WriteByte('}')
+	case *OrderedJSON:
+		out.WriteByte('{')
+		for idx, name := range node.Order {
+			if idx > 0 {
+				out.WriteByte(',')
 			}
-			b.WriteString(jsonQuote(k))
-			b.WriteByte(':')
-			marshalInto(b, t.Vals[k])
+			out.WriteString(quoteJSONString(name))
+			out.WriteByte(':')
+			renderValueInto(out, node.Values[name])
 		}
-		b.WriteByte('}')
+		out.WriteByte('}')
 	default:
-		b.WriteString("null")
+		out.WriteString("null")
 	}
 }
 
-// Marshal renders a value as compact JSON.
-func Marshal(v any) string {
-	var b strings.Builder
-	marshalInto(&b, v)
-	return b.String()
+// EncodeJSON renders a value as one compact JSON document.
+func EncodeJSON(v any) string {
+	var out strings.Builder
+	renderValueInto(&out, v)
+	return out.String()
 }
 
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
+// sortLexical orders strings ascending, in place (insertion sort: the
+// slices involved are a single object's keys, always short).
+func sortLexical(items []string) {
+	for i := 1; i < len(items); i++ {
+		for j := i; j > 0 && items[j] < items[j-1]; j-- {
+			items[j], items[j-1] = items[j-1], items[j]
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Reading values from text
 // ---------------------------------------------------------------------------
 
-type jsonParser struct {
-	data []byte
-	pos  int
+// jsonScanner walks one input document with a byte cursor.
+type jsonScanner struct {
+	src []byte
+	at  int
 }
 
-func (p *jsonParser) skipWS() {
-	for p.pos < len(p.data) {
-		c := p.data[p.pos]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			p.pos++
-		} else {
-			break
+func (sc *jsonScanner) skipBlanks() {
+	for sc.at < len(sc.src) {
+		switch sc.src[sc.at] {
+		case ' ', '\t', '\n', '\r':
+			sc.at++
+		default:
+			return
 		}
 	}
 }
 
-func (p *jsonParser) parseValue() (any, bool) {
-	p.skipWS()
-	if p.pos >= len(p.data) {
+// readValue parses whichever value starts at the cursor.
+func (sc *jsonScanner) readValue() (any, bool) {
+	sc.skipBlanks()
+	if sc.at >= len(sc.src) {
 		return nil, false
 	}
-	switch c := p.data[p.pos]; {
-	case c == '{':
-		return p.parseObject()
-	case c == '[':
-		return p.parseArray()
-	case c == '"':
-		s, ok := p.parseString()
-		return s, ok
-	case c == 't':
-		if p.pos+4 <= len(p.data) && string(p.data[p.pos:p.pos+4]) == "true" {
-			p.pos += 4
-			return true, true
-		}
-		return nil, false
-	case c == 'f':
-		if p.pos+5 <= len(p.data) && string(p.data[p.pos:p.pos+5]) == "false" {
-			p.pos += 5
-			return false, true
-		}
-		return nil, false
-	case c == 'n':
-		if p.pos+4 <= len(p.data) && string(p.data[p.pos:p.pos+4]) == "null" {
-			p.pos += 4
-			return nil, true
-		}
-		return nil, false
+	switch c := sc.src[sc.at]; c {
+	case '{':
+		return sc.readObject()
+	case '[':
+		return sc.readArray()
+	case '"':
+		return sc.readString()
+	case 't':
+		return sc.readKeyword("true", true)
+	case 'f':
+		return sc.readKeyword("false", false)
+	case 'n':
+		return sc.readKeyword("null", nil)
 	default:
-		return p.parseNumber()
+		return sc.readNumber()
 	}
 }
 
-func (p *jsonParser) parseObject() (any, bool) {
-	p.pos++ // {
+// readKeyword consumes one of the three literal words of JSON.
+func (sc *jsonScanner) readKeyword(word string, val any) (any, bool) {
+	if sc.at+len(word) <= len(sc.src) && string(sc.src[sc.at:sc.at+len(word)]) == word {
+		sc.at += len(word)
+		return val, true
+	}
+	return nil, false
+}
+
+func (sc *jsonScanner) readObject() (any, bool) {
+	sc.at++ // the opening brace
 	obj := map[string]any{}
-	p.skipWS()
-	if p.pos < len(p.data) && p.data[p.pos] == '}' {
-		p.pos++
+	sc.skipBlanks()
+	if sc.at < len(sc.src) && sc.src[sc.at] == '}' {
+		sc.at++
 		return obj, true
 	}
 	for {
-		p.skipWS()
-		key, ok := p.parseString()
+		sc.skipBlanks()
+		key, ok := sc.readString()
 		if !ok {
 			return nil, false
 		}
-		p.skipWS()
-		if p.pos >= len(p.data) || p.data[p.pos] != ':' {
+		sc.skipBlanks()
+		if sc.at >= len(sc.src) || sc.src[sc.at] != ':' {
 			return nil, false
 		}
-		p.pos++
-		val, ok := p.parseValue()
+		sc.at++
+		val, ok := sc.readValue()
 		if !ok {
 			return nil, false
 		}
 		obj[key] = val
-		p.skipWS()
-		if p.pos >= len(p.data) {
+		sc.skipBlanks()
+		if sc.at >= len(sc.src) {
 			return nil, false
 		}
-		if p.data[p.pos] == '}' {
-			p.pos++
+		if sc.src[sc.at] == '}' {
+			sc.at++
 			return obj, true
 		}
-		if p.data[p.pos] != ',' {
+		if sc.src[sc.at] != ',' {
 			return nil, false
 		}
-		p.pos++
+		sc.at++
 	}
 }
 
-func (p *jsonParser) parseArray() (any, bool) {
-	p.pos++ // [
+func (sc *jsonScanner) readArray() (any, bool) {
+	sc.at++ // the opening bracket
 	arr := []any{}
-	p.skipWS()
-	if p.pos < len(p.data) && p.data[p.pos] == ']' {
-		p.pos++
+	sc.skipBlanks()
+	if sc.at < len(sc.src) && sc.src[sc.at] == ']' {
+		sc.at++
 		return arr, true
 	}
 	for {
-		val, ok := p.parseValue()
+		val, ok := sc.readValue()
 		if !ok {
 			return nil, false
 		}
 		arr = append(arr, val)
-		p.skipWS()
-		if p.pos >= len(p.data) {
+		sc.skipBlanks()
+		if sc.at >= len(sc.src) {
 			return nil, false
 		}
-		if p.data[p.pos] == ']' {
-			p.pos++
+		if sc.src[sc.at] == ']' {
+			sc.at++
 			return arr, true
 		}
-		if p.data[p.pos] != ',' {
+		if sc.src[sc.at] != ',' {
 			return nil, false
 		}
-		p.pos++
+		sc.at++
 	}
 }
 
-func (p *jsonParser) parseString() (string, bool) {
-	if p.pos >= len(p.data) || p.data[p.pos] != '"' {
+// readString parses a string literal, resolving escapes. A high
+// surrogate directly followed by an escaped low surrogate combines
+// into the single rune the pair encodes.
+func (sc *jsonScanner) readString() (string, bool) {
+	if sc.at >= len(sc.src) || sc.src[sc.at] != '"' {
 		return "", false
 	}
-	p.pos++
-	var b strings.Builder
-	for p.pos < len(p.data) {
-		c := p.data[p.pos]
+	sc.at++
+	var out strings.Builder
+	for sc.at < len(sc.src) {
+		c := sc.src[sc.at]
 		if c == '"' {
-			p.pos++
-			return b.String(), true
+			sc.at++
+			return out.String(), true
 		}
-		if c == '\\' && p.pos+1 < len(p.data) {
-			e := p.data[p.pos+1]
-			switch e {
-			case 'n':
-				b.WriteByte('\n')
-				p.pos += 2
-			case 't':
-				b.WriteByte('\t')
-				p.pos += 2
-			case 'r':
-				b.WriteByte('\r')
-				p.pos += 2
-			case 'b':
-				b.WriteByte('\b')
-				p.pos += 2
-			case 'f':
-				b.WriteByte('\f')
-				p.pos += 2
-			case '/':
-				b.WriteByte('/')
-				p.pos += 2
-			case '\\':
-				b.WriteByte('\\')
-				p.pos += 2
-			case '"':
-				b.WriteByte('"')
-				p.pos += 2
-			case 'u':
-				if p.pos+6 <= len(p.data) {
-					hex := string(p.data[p.pos+2 : p.pos+6])
-					if n, err := strconv.ParseUint(hex, 16, 32); err == nil {
-						// Surrogate pairs: a high surrogate is followed by \uXXXX.
-						if n >= 0xD800 && n <= 0xDBFF && p.pos+12 <= len(p.data) &&
-							p.data[p.pos+6] == '\\' && p.data[p.pos+7] == 'u' {
-							hex2 := string(p.data[p.pos+8 : p.pos+12])
-							if m, err2 := strconv.ParseUint(hex2, 16, 32); err2 == nil && m >= 0xDC00 && m <= 0xDFFF {
-								r := 0x10000 + (rune(n-0xD800) << 10) + rune(m-0xDC00)
-								b.WriteRune(r)
-								p.pos += 12
-								continue
-							}
-						}
-						b.WriteRune(rune(n))
-						p.pos += 6
-						continue
-					}
-				}
-				return "", false
-			default:
-				return "", false
-			}
+		if c != '\\' {
+			out.WriteByte(c)
+			sc.at++
 			continue
 		}
-		b.WriteByte(c)
-		p.pos++
+		if sc.at+1 >= len(sc.src) {
+			return "", false
+		}
+		switch esc := sc.src[sc.at+1]; esc {
+		case 'n':
+			out.WriteByte('\n')
+			sc.at += 2
+		case 't':
+			out.WriteByte('\t')
+			sc.at += 2
+		case 'r':
+			out.WriteByte('\r')
+			sc.at += 2
+		case 'b':
+			out.WriteByte('\b')
+			sc.at += 2
+		case 'f':
+			out.WriteByte('\f')
+			sc.at += 2
+		case '/':
+			out.WriteByte('/')
+			sc.at += 2
+		case '\\':
+			out.WriteByte('\\')
+			sc.at += 2
+		case '"':
+			out.WriteByte('"')
+			sc.at += 2
+		case 'u':
+			r, width, ok := sc.readUnicodeEscape()
+			if !ok {
+				return "", false
+			}
+			out.WriteRune(r)
+			sc.at += width
+		default:
+			return "", false
+		}
 	}
 	return "", false
 }
 
-func (p *jsonParser) parseNumber() (any, bool) {
-	start := p.pos
-	if p.pos < len(p.data) && p.data[p.pos] == '-' {
-		p.pos++
+// readUnicodeEscape decodes the \uXXXX escape at the cursor (which
+// points at the backslash), joining a surrogate pair when one follows.
+// It reports the rune and the total bytes the escape spans.
+func (sc *jsonScanner) readUnicodeEscape() (rune, int, bool) {
+	if sc.at+6 > len(sc.src) {
+		return 0, 0, false
 	}
-	for p.pos < len(p.data) {
-		c := p.data[p.pos]
+	n, err := strconv.ParseUint(string(sc.src[sc.at+2:sc.at+6]), 16, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	// A high surrogate earns its meaning only paired with the low
+	// surrogate written right after it.
+	if n >= 0xD800 && n <= 0xDBFF && sc.at+12 <= len(sc.src) &&
+		sc.src[sc.at+6] == '\\' && sc.src[sc.at+7] == 'u' {
+		if m, err2 := strconv.ParseUint(string(sc.src[sc.at+8:sc.at+12]), 16, 32); err2 == nil && m >= 0xDC00 && m <= 0xDFFF {
+			joined := 0x10000 + (rune(n-0xD800) << 10) + rune(m-0xDC00)
+			return joined, 12, true
+		}
+	}
+	return rune(n), 6, true
+}
+
+func (sc *jsonScanner) readNumber() (any, bool) {
+	from := sc.at
+	if sc.at < len(sc.src) && sc.src[sc.at] == '-' {
+		sc.at++
+	}
+	for sc.at < len(sc.src) {
+		c := sc.src[sc.at]
 		if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
-			p.pos++
+			sc.at++
 		} else {
 			break
 		}
 	}
-	if p.pos == start {
+	if sc.at == from {
 		return nil, false
 	}
-	text := string(p.data[start:p.pos])
-	if f, err := strconv.ParseFloat(text, 64); err == nil {
+	if f, err := strconv.ParseFloat(string(sc.src[from:sc.at]), 64); err == nil {
 		return f, true
 	}
 	return nil, false
 }
 
-// ParseJSON parses a whole JSON document. It reports false on any syntax error.
-func ParseJSON(data []byte) (any, bool) {
-	p := &jsonParser{data: data}
-	v, ok := p.parseValue()
+// DecodeJSON parses a complete JSON document, rejecting trailing
+// content and any syntax error along the way.
+func DecodeJSON(data []byte) (any, bool) {
+	sc := &jsonScanner{src: data}
+	v, ok := sc.readValue()
 	if !ok {
 		return nil, false
 	}
-	p.skipWS()
-	if p.pos != len(p.data) {
+	sc.skipBlanks()
+	if sc.at != len(sc.src) {
 		return nil, false
 	}
 	return v, true
 }
 
-// Helpers for reading fields out of a parsed object body.
+// ---------------------------------------------------------------------------
+// Pulling typed members out of a parsed object
+// ---------------------------------------------------------------------------
 
-func objMap(v any) (map[string]any, bool) {
+func asObjectMap(v any) (map[string]any, bool) {
 	m, ok := v.(map[string]any)
 	return m, ok
 }
 
-func strField(m map[string]any, name string) (string, bool) {
-	v, ok := m[name]
-	if !ok {
+func stringMember(m map[string]any, name string) (string, bool) {
+	raw, seen := m[name]
+	if !seen {
 		return "", false
 	}
-	s, ok := v.(string)
+	s, ok := raw.(string)
 	return s, ok
 }
 
-func boolField(m map[string]any, name string) (bool, bool) {
-	v, ok := m[name]
-	if !ok {
+func boolMember(m map[string]any, name string) (bool, bool) {
+	raw, seen := m[name]
+	if !seen {
 		return false, false
 	}
-	b, ok := v.(bool)
+	b, ok := raw.(bool)
 	return b, ok
 }
 
-func numField(m map[string]any, name string) (float64, bool) {
-	v, ok := m[name]
-	if !ok {
+func numberMember(m map[string]any, name string) (float64, bool) {
+	raw, seen := m[name]
+	if !seen {
 		return 0, false
 	}
-	f, ok := v.(float64)
+	f, ok := raw.(float64)
 	return f, ok
 }

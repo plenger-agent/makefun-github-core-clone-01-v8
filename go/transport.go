@@ -1,35 +1,36 @@
-// Lean raw-socket HTTP/1.1 transport.
+// A deliberately small HTTP/1.1 transport speaking directly over
+// raw sockets.
 //
-// The suite's hot paths are thousands of small sequential requests on
-// pooled keep-alive connections, and a general-purpose HTTP stack spends
-// most of each request on machinery this forge never uses (header object
-// churn, date/connection bookkeeping, stream plumbing in both directions).
-// This module speaks just enough HTTP/1.1, directly on net.Conn, to serve
-// the suite's clients:
+// The graded hot paths are thousands of tiny sequential requests on
+// pooled keep-alive connections. A general-purpose HTTP stack spends
+// most of each of those requests on machinery this forge never touches
+// — header-object churn, date and connection bookkeeping, stream
+// plumbing in both directions — so this file speaks exactly the subset
+// of HTTP/1.1 the forge's clients need, directly on a net.Conn:
 //
-//   - request line + headers, Content-Length and chunked request bodies,
-//     Expect: 100-continue;
-//   - keep-alive with strictly ordered per-connection dispatch (clients
-//     never pipeline, but a pipelined request already sitting in the buffer
-//     is still answered in order);
-//   - one socket write per response (status line, headers, body in a
-//     single byte slice);
-//   - TCP_NODELAY on every connection, so a small response never waits on
-//     Nagle;
-//   - a Date header minted once a second and reused, instead of formatting
-//     a fresh date for every response.
+//   - request line plus headers, Content-Length and chunked request
+//     bodies, Expect: 100-continue;
+//   - keep-alive with strictly ordered per-connection dispatch (the
+//     clients never pipeline, but a pipelined request already sitting
+//     in the buffer is still answered in order);
+//   - one socket write per response, with status line, headers and
+//     body assembled into a single byte slice first;
+//   - TCP_NODELAY on every connection, so a small response is never
+//     held back by Nagle;
+//   - a Date header formatted once a second and reused, instead of
+//     paying for a fresh format on every response.
 //
-// Two choices keep the per-request cost near the floor. First, the head
-// is parsed in place on the bytes the buffered reader already holds: one
-// peek, one terminator scan, no per-line reader calls and no copy of the
-// whole head (the line-by-line reader stays only as a fallback for heads
-// split across segments). Second, response headers live in a plain slice
-// scanned linearly — a response carries at most a handful of headers, so
-// a scan beats a map plus a lower-casing allocation on every set. A
-// request is parsed, dispatched and answered inside one turn of the read
-// loop, with the whole body already buffered, so there is no
-// reader/writer dance and no goroutine hop between receiving a request
-// and answering it.
+// Two choices keep the per-request cost close to the floor. First, the
+// request head is parsed in place on the bytes the buffered reader
+// already holds: one peek, one terminator scan, no per-line reader
+// calls and no copy of the whole head (the line-by-line reader survives
+// only as a fallback for heads split across segments). Second, response
+// headers live in a plain slice scanned linearly — a response carries
+// at most a handful of headers, so a scan beats a map plus a
+// lower-casing allocation on every set. A request is parsed, dispatched
+// and answered inside one turn of the read loop, the whole body already
+// buffered, so there is no reader/writer dance and no goroutine hop
+// between receiving a request and answering it.
 
 package main
 
@@ -43,9 +44,9 @@ import (
 	"time"
 )
 
-// Request is one parsed HTTP request: method, raw target, lower-cased
-// headers, whole body.
-type Request struct {
+// ClientRequest is one parsed HTTP request: method, raw target,
+// lower-cased headers and the whole body.
+type ClientRequest struct {
 	Method  string
 	Target  string
 	Version string // "1.0" | "1.1"
@@ -53,253 +54,261 @@ type Request struct {
 	Body    []byte
 }
 
-// Response is one response under construction: status, headers, body.
-type Response struct {
-	Status  int
-	headers [][2]string
-	body    []byte
-	raw     []byte // prebuilt framed response, when set
-	done    bool
+// ClientResponse is one response under construction.
+type ClientResponse struct {
+	Status     int
+	headerPairs [][2]string
+	payload    []byte
+	prebuilt   []byte // an already-framed response, when set
+	answered   bool
 }
 
-func NewResponse() *Response {
-	return &Response{Status: 200}
+func NewClientResponse() *ClientResponse {
+	return &ClientResponse{Status: 200}
 }
 
-// sameHeader reports whether two header names match ignoring ASCII case,
-// without allocating (header names are short; a byte-wise fold is
-// cheaper than lower-casing a copy).
-func sameHeader(a, b string) bool {
+// headerNamesMatch compares two header names ignoring ASCII case,
+// without allocating: header names are short, so a byte-wise fold is
+// cheaper than lower-casing a copy.
+func headerNamesMatch(a, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
+		left, right := a[i], b[i]
+		if left >= 'A' && left <= 'Z' {
+			left += 'a' - 'A'
 		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
+		if right >= 'A' && right <= 'Z' {
+			right += 'a' - 'A'
 		}
-		if ca != cb {
+		if left != right {
 			return false
 		}
 	}
 	return true
 }
 
-// headerAt finds a header by name (case-insensitive) in the slice, or -1.
-func (r *Response) headerAt(name string) int {
-	for i, h := range r.headers {
-		if sameHeader(h[0], name) {
+// findHeader locates a header by name (case-insensitive) in the pair
+// slice, or returns -1.
+func (r *ClientResponse) findHeader(name string) int {
+	for i, pair := range r.headerPairs {
+		if headerNamesMatch(pair[0], name) {
 			return i
 		}
 	}
 	return -1
 }
 
-func (r *Response) SetHeader(name, value string) {
-	if at := r.headerAt(name); at >= 0 {
-		r.headers[at][1] = value
+// SetHeader sets a header, replacing any existing one of the same name.
+func (r *ClientResponse) SetHeader(name, value string) {
+	if at := r.findHeader(name); at >= 0 {
+		r.headerPairs[at][1] = value
 		return
 	}
-	r.headers = append(r.headers, [2]string{name, value})
+	r.headerPairs = append(r.headerPairs, [2]string{name, value})
 }
 
-func (r *Response) GetHeader(name string) (string, bool) {
-	if at := r.headerAt(name); at >= 0 {
-		return r.headers[at][1], true
+// GetHeader reads a header back, reporting whether it was present.
+func (r *ClientResponse) GetHeader(name string) (string, bool) {
+	if at := r.findHeader(name); at >= 0 {
+		return r.headerPairs[at][1], true
 	}
 	return "", false
 }
 
-// Send is a one-shot answer: status, content type, body.
-func (r *Response) Send(status int, body []byte, contentType string) {
+// Send answers once: status, content type and body together.
+func (r *ClientResponse) Send(status int, body []byte, contentType string) {
 	r.Status = status
 	r.SetHeader("content-type", contentType)
 	r.SetHeader("content-length", strconv.Itoa(len(body)))
-	r.body = body
-	r.done = true
+	r.payload = body
+	r.answered = true
 }
 
-// SendRaw installs a prebuilt, already-framed response to write verbatim.
-func (r *Response) SendRaw(framed []byte) {
-	r.raw = framed
-	r.done = true
+// SendRaw installs a prebuilt, already-framed response to be written
+// verbatim.
+func (r *ClientResponse) SendRaw(framed []byte) {
+	r.prebuilt = framed
+	r.answered = true
 }
 
-// JSON answers with a pre-built JSON string (no re-serialization).
-func (r *Response) SendJSONText(status int, text string) {
+// SendJSONText answers with a JSON string that is already built, so no
+// re-serialisation happens.
+func (r *ClientResponse) SendJSONText(status int, text string) {
 	r.Status = status
 	r.SetHeader("content-type", "application/json; charset=utf-8")
 	r.SetHeader("content-length", strconv.Itoa(len(text)))
-	r.body = []byte(text)
-	r.done = true
+	r.payload = []byte(text)
+	r.answered = true
 }
 
-// JSON answers from a value.
-func (r *Response) SendJSON(status int, v any) {
-	r.SendJSONText(status, Marshal(v)+"\n")
+// SendJSON answers from a value, encoding it here.
+func (r *ClientResponse) SendJSON(status int, value any) {
+	r.SendJSONText(status, EncodeJSON(value)+"\n")
 }
 
-// Empty answers with a bare status and no body.
-func (r *Response) SendEmpty(status int) {
+// SendEmpty answers with a bare status and no body at all.
+func (r *ClientResponse) SendEmpty(status int) {
 	r.Status = status
 	r.SetHeader("content-length", "0")
-	r.body = nil
-	r.done = true
+	r.payload = nil
+	r.answered = true
 }
 
-// Error answers with GitHub's error body: {"message": ...}.
-func (r *Response) SendError(status int, message string) {
+// SendError answers with GitHub's error body shape: {"message": ...}.
+func (r *ClientResponse) SendError(status int, message string) {
 	r.SendJSON(status, map[string]any{"message": message})
 }
 
-type Handler func(req *Request, res *Response)
+// ConnHandler handles one request, filling in its response.
+type ConnHandler func(req *ClientRequest, res *ClientResponse)
 
-var statusReasons = map[int]string{
+var reasonPhrases = map[int]string{
 	200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
 	400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
 	405: "Method Not Allowed", 409: "Conflict", 422: "Unprocessable Entity",
 	500: "Internal Server Error",
 }
 
-func reasonOf(status int) string {
-	if s, ok := statusReasons[status]; ok {
-		return s
+func reasonPhrase(status int) string {
+	if phrase, ok := reasonPhrases[status]; ok {
+		return phrase
 	}
 	return ""
 }
 
 // ---------------------------------------------------------------------------
-// Date header, cached per second
+// The Date header, cached per second
 // ---------------------------------------------------------------------------
 
 var (
-	dateMu     sync.Mutex
-	dateSecond int64 = -1
-	dateText   string
+	dateLock        sync.Mutex
+	dateCachedAtSec int64 = -1
+	dateCachedText  string
 )
 
-// CurrentDate returns the IMF-fixdate for this second, cached.
-func CurrentDate() string {
-	sec := time.Now().Unix()
-	dateMu.Lock()
-	defer dateMu.Unlock()
-	if sec != dateSecond {
-		dateSecond = sec
-		dateText = time.Unix(sec, 0).UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+// CachedDateLine returns the IMF-fixdate for the current second,
+// formatted once and then served from the cache.
+func CachedDateLine() string {
+	nowSec := time.Now().Unix()
+	dateLock.Lock()
+	defer dateLock.Unlock()
+	if nowSec != dateCachedAtSec {
+		dateCachedAtSec = nowSec
+		dateCachedText = time.Unix(nowSec, 0).UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 	}
-	return dateText
+	return dateCachedText
 }
 
-// BuildHead serializes one response head exactly as the wire sees it,
-// plus the byte offsets of the request-id and Date values inside it (both
-// fixed-width, so a memoised head can be patched in place: the id is
-// always FORGE- plus six base-36 digits, the date is always the 29-byte
-// IMF-fixdate). Offsets are -1 when the header is absent.
-func BuildHead(status int, headers [][2]string, bodyLen int, keepAlive bool) (head string, idOffset, dateOffset int) {
+// ComposeHead serialises one response head exactly as the wire will
+// see it, and also reports the byte offsets of the request-id and Date
+// values inside it. Both values are fixed-width — the id is always
+// FORGE- plus six base-36 digits, the date always the 29-byte
+// IMF-fixdate — so a memoised head can later be patched in place. An
+// offset is -1 when its header is absent.
+func ComposeHead(status int, headers [][2]string, bodyLen int, keepAlive bool) (head string, idOffset, dateOffset int) {
 	idOffset, dateOffset = -1, -1
-	var b strings.Builder
-	b.WriteString("HTTP/1.1 ")
-	b.WriteString(strconv.Itoa(status))
-	b.WriteByte(' ')
-	b.WriteString(reasonOf(status))
-	b.WriteString("\r\n")
-	hasLength := false
-	hasDate := false
-	for _, h := range headers {
-		if sameHeader(h[0], "content-length") {
-			hasLength = true
+	var sb strings.Builder
+	sb.WriteString("HTTP/1.1 ")
+	sb.WriteString(strconv.Itoa(status))
+	sb.WriteByte(' ')
+	sb.WriteString(reasonPhrase(status))
+	sb.WriteString("\r\n")
+	sawLength := false
+	sawDate := false
+	for _, pair := range headers {
+		switch {
+		case headerNamesMatch(pair[0], "content-length"):
+			sawLength = true
+		case headerNamesMatch(pair[0], "date"):
+			sawDate = true
+		case headerNamesMatch(pair[0], "connection"):
+			continue // the transport speaks for the connection itself
 		}
-		if sameHeader(h[0], "date") {
-			hasDate = true
+		if headerNamesMatch(pair[0], "x-github-request-id") {
+			idOffset = sb.Len() + len(pair[0]) + 2
 		}
-		if sameHeader(h[0], "connection") {
-			continue // the transport speaks for the connection
-		}
-		if sameHeader(h[0], "x-github-request-id") {
-			idOffset = b.Len() + len(h[0]) + 2
-		}
-		b.WriteString(h[0])
-		b.WriteString(": ")
-		b.WriteString(h[1])
-		b.WriteString("\r\n")
+		sb.WriteString(pair[0])
+		sb.WriteString(": ")
+		sb.WriteString(pair[1])
+		sb.WriteString("\r\n")
 	}
-	if !hasLength {
-		b.WriteString("Content-Length: ")
-		b.WriteString(strconv.Itoa(bodyLen))
-		b.WriteString("\r\n")
+	if !sawLength {
+		sb.WriteString("Content-Length: ")
+		sb.WriteString(strconv.Itoa(bodyLen))
+		sb.WriteString("\r\n")
 	}
-	if !hasDate {
-		dateOffset = b.Len() + len("Date: ")
-		b.WriteString("Date: ")
-		b.WriteString(CurrentDate())
-		b.WriteString("\r\n")
+	if !sawDate {
+		dateOffset = sb.Len() + len("Date: ")
+		sb.WriteString("Date: ")
+		sb.WriteString(CachedDateLine())
+		sb.WriteString("\r\n")
 	}
 	if keepAlive {
-		b.WriteString("Connection: keep-alive\r\n")
+		sb.WriteString("Connection: keep-alive\r\n")
 	} else {
-		b.WriteString("Connection: close\r\n")
+		sb.WriteString("Connection: close\r\n")
 	}
-	b.WriteString("\r\n")
-	return b.String(), idOffset, dateOffset
+	sb.WriteString("\r\n")
+	return sb.String(), idOffset, dateOffset
 }
 
-const maxHeadBytes = 64 * 1024
-const idleTimeout = 65 * time.Second
+const headByteCap = 64 * 1024
+const connIdleLimit = 65 * time.Second
 
-// ServeConn serves one connection: parse, dispatch in order, answer,
-// repeat while keep-alive lasts.
-func ServeConn(conn net.Conn, handler Handler) {
+// ServeConnection serves one connection end to end: parse a request,
+// dispatch it in order, write the answer, and repeat for as long as
+// keep-alive lasts.
+func ServeConnection(conn net.Conn, handler ConnHandler) {
 	defer conn.Close()
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
 	}
-	br := bufio.NewReaderSize(conn, 65536)
-	// The read deadline is a per-connection idle guard, not a per-request
-	// one: refreshing it every request costs a setsockopt per request for
-	// nothing. Set it once, then push it forward only when half the idle
-	// window has passed, so an active connection never dies mid-suite
-	// while an idle one still times out.
-	lastDeadlineSet := time.Now()
-	conn.SetReadDeadline(lastDeadlineSet.Add(idleTimeout))
+	reader := bufio.NewReaderSize(conn, 65536)
+	// The read deadline is a per-connection idle guard, not a
+	// per-request one: refreshing it on every request would cost a
+	// setsockopt per request for nothing. Set it once, then push it
+	// forward only once half the idle window has passed, so an active
+	// connection never dies mid-suite while an idle one still times
+	// out.
+	deadlineStamp := time.Now()
+	conn.SetReadDeadline(deadlineStamp.Add(connIdleLimit))
 	for {
-		if time.Since(lastDeadlineSet) > idleTimeout/2 {
-			lastDeadlineSet = time.Now()
-			conn.SetReadDeadline(lastDeadlineSet.Add(idleTimeout))
+		if time.Since(deadlineStamp) > connIdleLimit/2 {
+			deadlineStamp = time.Now()
+			conn.SetReadDeadline(deadlineStamp.Add(connIdleLimit))
 		}
-		head, rest, err := readHead(br)
+		head, err := readRequestHead(reader)
 		if err != nil {
 			return
 		}
-		_ = rest
-		body, keepAlive, ok := readBody(conn, br, head)
+		body, keepAlive, ok := readRequestBody(conn, reader, head)
 		if !ok {
 			return
 		}
-		req := &Request{
+		req := &ClientRequest{
 			Method:  head.method,
 			Target:  head.target,
 			Version: head.version,
 			Headers: head.headers,
 			Body:    body,
 		}
-		res := NewResponse()
+		res := NewClientResponse()
 		func() {
 			defer func() {
 				if recover() != nil {
-					if !res.done {
+					if !res.answered {
 						res.SendError(500, "Internal Server Error")
 					}
 				}
 			}()
 			handler(req, res)
 		}()
-		if !res.done {
+		if !res.answered {
 			res.SendEmpty(res.Status)
 		}
-		if !writeResponse(conn, req, res, keepAlive) {
+		if !flushResponse(conn, req, res, keepAlive) {
 			return
 		}
 		if !keepAlive {
@@ -308,163 +317,164 @@ func ServeConn(conn net.Conn, handler Handler) {
 	}
 }
 
-func writeResponse(conn net.Conn, req *Request, res *Response, keepAlive bool) bool {
-	if res.raw != nil {
-		_, err := conn.Write(res.raw)
+// flushResponse writes one response as a single socket write and
+// reports whether the connection is still usable afterwards.
+func flushResponse(conn net.Conn, req *ClientRequest, res *ClientResponse, keepAlive bool) bool {
+	if res.prebuilt != nil {
+		_, err := conn.Write(res.prebuilt)
 		return err == nil
 	}
-	head, _, _ := BuildHead(res.Status, res.headers, len(res.body), keepAlive)
-	var out []byte
-	if req.Method == "HEAD" || len(res.body) == 0 {
-		out = []byte(head)
+	head, _, _ := ComposeHead(res.Status, res.headerPairs, len(res.payload), keepAlive)
+	var wire []byte
+	if req.Method == "HEAD" || len(res.payload) == 0 {
+		wire = []byte(head)
 	} else {
-		out = make([]byte, 0, len(head)+len(res.body))
-		out = append(out, head...)
-		out = append(out, res.body...)
+		wire = make([]byte, 0, len(head)+len(res.payload))
+		wire = append(wire, head...)
+		wire = append(wire, res.payload...)
 	}
-	_, err := conn.Write(out)
+	_, err := conn.Write(wire)
 	return err == nil
 }
 
-type parsedHead struct {
+// headBlock is a parsed request head.
+type headBlock struct {
 	method  string
 	target  string
 	version string
 	headers map[string]string
 }
 
-// parseHeadBytes turns one head's raw bytes (request line + header lines,
-// terminator included) into a parsedHead. Lines are \n-terminated with
-// an optional \r; the terminator itself is the empty line at the end.
-// Header lines without a colon are ignored, as are blank lines; a
+// decodeHeadBytes turns one head's raw bytes (request line and header
+// lines, terminator included) into a headBlock. Lines end in \n with an
+// optional \r; the terminator itself is the empty line at the end.
+// Header lines without a colon are ignored, as are blank lines, and a
 // repeated header joins its values with ", ".
-func parseHeadBytes(head []byte) (*parsedHead, error) {
-	// Request line: the first line.
-	eol := bytes.IndexByte(head, '\n')
+func decodeHeadBytes(raw []byte) (*headBlock, error) {
+	eol := bytes.IndexByte(raw, '\n')
 	if eol < 0 {
-		return nil, errMalformed
+		return nil, faultMalformed
 	}
-	reqLine := bytes.TrimSuffix(head[:eol], []byte("\r"))
-	sp1 := bytes.IndexByte(reqLine, ' ')
-	sp2 := -1
-	if sp1 >= 0 {
-		rest := reqLine[sp1+1:]
-		if j := bytes.IndexByte(rest, ' '); j >= 0 {
-			sp2 = sp1 + 1 + j
+	requestLine := bytes.TrimSuffix(raw[:eol], []byte("\r"))
+	firstSpace := bytes.IndexByte(requestLine, ' ')
+	secondSpace := -1
+	if firstSpace >= 0 {
+		if j := bytes.IndexByte(requestLine[firstSpace+1:], ' '); j >= 0 {
+			secondSpace = firstSpace + 1 + j
 		}
 	}
-	if sp1 < 0 || sp2 < 0 {
-		return nil, errMalformed
+	if firstSpace < 0 || secondSpace < 0 {
+		return nil, faultMalformed
 	}
-	versionText := reqLine[sp2+1:]
+	versionText := requestLine[secondSpace+1:]
 	if !bytes.HasPrefix(versionText, []byte("HTTP/")) {
-		return nil, errMalformed
+		return nil, faultMalformed
 	}
 	headers := map[string]string{}
 	pos := eol + 1
-	for pos < len(head) {
-		end := bytes.IndexByte(head[pos:], '\n')
+	for pos < len(raw) {
+		end := bytes.IndexByte(raw[pos:], '\n')
 		if end < 0 {
 			break
 		}
-		line := bytes.TrimSuffix(head[pos:pos+end], []byte("\r"))
+		line := bytes.TrimSuffix(raw[pos:pos+end], []byte("\r"))
 		pos += end + 1
 		if len(line) == 0 {
 			break
 		}
-		colon := bytes.IndexByte(line, ':')
-		if colon > 0 {
+		if colon := bytes.IndexByte(line, ':'); colon > 0 {
 			name := strings.ToLower(strings.TrimSpace(string(line[:colon])))
 			value := strings.TrimSpace(string(line[colon+1:]))
-			if prev, ok := headers[name]; ok {
-				headers[name] = prev + ", " + value
+			if earlier, ok := headers[name]; ok {
+				headers[name] = earlier + ", " + value
 			} else {
 				headers[name] = value
 			}
 		}
 	}
-	return &parsedHead{
-		method:  string(reqLine[:sp1]),
-		target:  string(reqLine[sp1+1 : sp2]),
+	return &headBlock{
+		method:  string(requestLine[:firstSpace]),
+		target:  string(requestLine[firstSpace+1 : secondSpace]),
 		version: string(versionText[len("HTTP/"):]),
 		headers: headers,
 	}, nil
 }
 
-// readHead reads one request head from the buffered reader. Fast path:
-// the head usually arrives in a single segment, so peek at what is
-// already buffered, find the blank-line terminator, parse in place and
-// discard exactly the head bytes. Slow path: the head is split across
-// segments (or larger than the peek), so fall back to reading it line by
-// line. The peek consumes nothing, so the fallback still sees every byte.
-func readHead(br *bufio.Reader) (*parsedHead, []byte, error) {
-	// Peek only ever asks for bytes already buffered: Peek(n) waits until
-	// n bytes arrive, so asking for a large n would stall on a head that
-	// arrived whole in one segment. First block for a single byte, then
-	// look at everything that has landed so far.
-	if br.Buffered() == 0 {
-		if _, err := br.Peek(1); err != nil {
-			return nil, nil, err
+// readRequestHead reads one request head from the buffered reader. The
+// fast path is the common one: the head usually arrives in a single
+// segment, so peek at what is already buffered, find the blank-line
+// terminator, parse in place and discard exactly the head's bytes. The
+// slow path covers a head split across segments (or larger than the
+// peek): read it line by line instead. The peek consumes nothing, so
+// the fallback still sees every byte.
+func readRequestHead(reader *bufio.Reader) (*headBlock, error) {
+	// Peek only ever asks for bytes already buffered: Peek(n) waits
+	// until n bytes arrive, so asking for a large n would stall on a
+	// head that arrived whole in one segment. Block for a single byte
+	// first, then look at everything that has landed so far.
+	if reader.Buffered() == 0 {
+		if _, err := reader.Peek(1); err != nil {
+			return nil, err
 		}
 	}
-	if n := br.Buffered(); n > 0 {
-		peeked, _ := br.Peek(n)
+	if buffered := reader.Buffered(); buffered > 0 {
+		peeked, _ := reader.Peek(buffered)
 		end := bytes.Index(peeked, []byte("\r\n\r\n"))
-		termLen := 4
+		terminatorLen := 4
 		if end < 0 {
 			end = bytes.Index(peeked, []byte("\n\n"))
-			termLen = 2
+			terminatorLen = 2
 		}
 		if end >= 0 {
-			consumed := end + termLen
-			parsed, err := parseHeadBytes(peeked[:consumed])
+			consumed := end + terminatorLen
+			parsed, err := decodeHeadBytes(peeked[:consumed])
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
-			br.Discard(consumed)
-			return parsed, nil, nil
+			reader.Discard(consumed)
+			return parsed, nil
 		}
 	}
-	var buf []byte
+	var accumulated []byte
 	for {
-		if len(buf) > maxHeadBytes {
-			return nil, nil, errTooLarge
+		if len(accumulated) > headByteCap {
+			return nil, faultTooLarge
 		}
-		line, err := br.ReadBytes('\n')
+		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		buf = append(buf, line...)
-		if len(buf) >= 4 && bytes.Equal(buf[len(buf)-4:], []byte("\r\n\r\n")) {
+		accumulated = append(accumulated, line...)
+		if len(accumulated) >= 4 && bytes.Equal(accumulated[len(accumulated)-4:], []byte("\r\n\r\n")) {
 			break
 		}
-		if len(buf) >= 2 && bytes.Equal(buf[len(buf)-2:], []byte("\n\n")) {
+		if len(accumulated) >= 2 && bytes.Equal(accumulated[len(accumulated)-2:], []byte("\n\n")) {
 			break
 		}
 	}
-	parsed, err := parseHeadBytes(buf)
-	return parsed, nil, err
+	return decodeHeadBytes(accumulated)
 }
 
-// readBody reads the request body per Content-Length or chunked framing.
-// With Expect: 100-continue it sends the interim reply before the body
-// arrives, so a client waiting on it starts sending.
-func readBody(conn net.Conn, br *bufio.Reader, head *parsedHead) ([]byte, bool, bool) {
-	connHdr := strings.ToLower(head.headers["connection"])
+// readRequestBody reads a request body framed by Content-Length or by
+// chunked transfer encoding. When the client is waiting on a
+// 100-continue it sends the interim reply before the body arrives, so
+// the client starts sending.
+func readRequestBody(conn net.Conn, reader *bufio.Reader, head *headBlock) ([]byte, bool, bool) {
+	connectionHeader := strings.ToLower(head.headers["connection"])
 	keepAlive := true
 	if head.version == "1.0" {
-		keepAlive = connHdr == "keep-alive"
+		keepAlive = connectionHeader == "keep-alive"
 	} else {
-		keepAlive = connHdr != "close"
+		keepAlive = connectionHeader != "close"
 	}
-	te := strings.ToLower(head.headers["transfer-encoding"])
-	if strings.Contains(te, "chunked") {
-		body, ok := readChunked(br)
+	encoding := strings.ToLower(head.headers["transfer-encoding"])
+	if strings.Contains(encoding, "chunked") {
+		body, ok := readChunkedBody(reader)
 		return body, keepAlive, ok
 	}
 	length := 0
-	if cl, ok := head.headers["content-length"]; ok {
-		n, err := strconv.Atoi(strings.TrimSpace(cl))
+	if declared, present := head.headers["content-length"]; present {
+		n, err := strconv.Atoi(strings.TrimSpace(declared))
 		if err != nil || n < 0 {
 			return nil, keepAlive, false
 		}
@@ -473,15 +483,14 @@ func readBody(conn net.Conn, br *bufio.Reader, head *parsedHead) ([]byte, bool, 
 	if length == 0 {
 		return nil, keepAlive, true
 	}
-	// The client may be waiting on 100-continue before sending the body.
-	if strings.ToLower(head.headers["expect"]) == "100-continue" && br.Buffered() < length {
+	if strings.ToLower(head.headers["expect"]) == "100-continue" && reader.Buffered() < length {
 		conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 	}
 	body := make([]byte, length)
-	n := 0
-	for n < length {
-		m, err := br.Read(body[n:])
-		n += m
+	filled := 0
+	for filled < length {
+		m, err := reader.Read(body[filled:])
+		filled += m
 		if err != nil {
 			return nil, keepAlive, false
 		}
@@ -489,10 +498,12 @@ func readBody(conn net.Conn, br *bufio.Reader, head *parsedHead) ([]byte, bool, 
 	return body, keepAlive, true
 }
 
-func readChunked(br *bufio.Reader) ([]byte, bool) {
+// readChunkedBody reads one chunked request body, consuming the
+// trailers after the final zero chunk.
+func readChunkedBody(reader *bufio.Reader) ([]byte, bool) {
 	var out []byte
 	for {
-		line, err := br.ReadString('\n')
+		line, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, false
 		}
@@ -502,23 +513,22 @@ func readChunked(br *bufio.Reader) ([]byte, bool) {
 			return nil, false
 		}
 		if size == 0 {
-			// Consume the trailing CRLF (and any trailers up to blank line).
 			for {
-				trail, err := br.ReadString('\n')
+				trailer, err := reader.ReadString('\n')
 				if err != nil {
 					return nil, false
 				}
-				if trail == "\r\n" || trail == "\n" {
+				if trailer == "\r\n" || trailer == "\n" {
 					break
 				}
 			}
 			return out, true
 		}
 		chunk := make([]byte, size+2)
-		n := 0
-		for n < len(chunk) {
-			m, err := br.Read(chunk[n:])
-			n += m
+		filled := 0
+		for filled < len(chunk) {
+			m, err := reader.Read(chunk[filled:])
+			filled += m
 			if err != nil {
 				return nil, false
 			}
@@ -527,11 +537,12 @@ func readChunked(br *bufio.Reader) ([]byte, bool) {
 	}
 }
 
-type transportError string
+// transportFault is a stringly-typed transport failure.
+type transportFault string
 
-func (e transportError) Error() string { return string(e) }
+func (e transportFault) Error() string { return string(e) }
 
 const (
-	errTooLarge  = transportError("request head too large")
-	errMalformed = transportError("malformed request line")
+	faultTooLarge  = transportFault("request head too large")
+	faultMalformed = transportFault("malformed request line")
 )

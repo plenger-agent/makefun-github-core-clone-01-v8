@@ -1,18 +1,20 @@
-// The forge's HTTP application: one Vault behind four surfaces (git
-// smart HTTP, REST v3, GraphQL v4 and MCP), routed here over the
-// synchronous raw-socket transport. Every answer carries the
-// X-GitHub-Request-Id the protocol checks require.
+// The forge's HTTP application layer: one Depot behind four
+// surfaces — git smart HTTP, REST v3, GraphQL v4 and MCP — all routed
+// here
+// on top of the synchronous raw-socket transport. Every answer carries
+// the X-GitHub-Request-Id the protocol checks insist on.
 //
-// One optimisation lives at this layer because only this layer sees every
-// request: GET answers are memoised as the exact bytes the transport
-// would write — head and body already framed — and a repeat is served by
-// copying those bytes and patching just the two fields that move: the
-// fixed-width request id and the Date. The read workload re-asks for the
-// same issue two thousand times, so that path is a single-entry memo hit:
-// one key comparison, one buffer copy, two fixed-width writes, one socket
-// write. Any non-GET request empties the cache before it runs, so a replay
-// can never outlive the state it came from; the request id is never
-// cached, each replay mints its own.
+// One optimisation lives at this layer because only this layer sees
+// every request: GET answers are memoised as the exact bytes the
+// transport would put on the wire, head and body already framed, and a
+// repeat is served by copying those bytes and patching just the two
+// fields that move — the fixed-width request id and the Date. The read
+// workload asks for the same issue two thousand times, so that path is
+// a single-entry memo hit: one key comparison, one buffer copy, two
+// fixed-width writes, one socket write. Any non-GET request empties
+// the cache before it runs, so a replay can never outlive the state it
+// was captured from; the request id itself is never cached — each
+// replay mints its own.
 
 package main
 
@@ -25,22 +27,23 @@ import (
 	"time"
 )
 
-// logMS enables per-request handler timing on stderr (dev profiling).
-var logMS = os.Getenv("FORGE_LOG_MS") != ""
+// timingEnabled switches on per-request handler timing on stderr (a
+// development profiling aid).
+var timingEnabled = os.Getenv("FORGE_LOG_MS") != ""
 
-// The bearer token the env issues, read once at startup.
+// shopToken is the bearer token the environment issues, read once at
+// startup.
 var shopToken = os.Getenv("MAKEFUN_SHOP_TOKEN")
 
-func isAuthenticated(req *Request) bool {
+func requestAuthenticated(req *ClientRequest) bool {
 	return req.Headers["authorization"] == "Bearer "+shopToken
 }
 
-// splitTarget splits a raw request target into decoded path segments and
-// the query string.
-func splitTarget(target string) (segments []string, query string) {
-	qAt := strings.Index(target, "?")
+// splitRequestTarget breaks a raw request target into decoded path
+// segments and the query string.
+func splitRequestTarget(target string) (segments []string, query string) {
 	pathPart := target
-	if qAt >= 0 {
+	if qAt := strings.Index(target, "?"); qAt >= 0 {
 		pathPart = target[:qAt]
 		query = target[qAt+1:]
 	}
@@ -49,8 +52,8 @@ func splitTarget(target string) (segments []string, query string) {
 			continue
 		}
 		if strings.Contains(piece, "%") {
-			if dec, err := url.PathUnescape(piece); err == nil {
-				piece = dec
+			if decoded, err := url.PathUnescape(piece); err == nil {
+				piece = decoded
 			}
 		}
 		segments = append(segments, piece)
@@ -58,11 +61,12 @@ func splitTarget(target string) (segments []string, query string) {
 	return segments, query
 }
 
-// parseQuery parses a query string into a map (first value wins).
-func parseQuery(query string) map[string]string {
-	out := map[string]string{}
+// parseQueryString parses a query string into a map; when a name
+// repeats, the first value wins.
+func parseQueryString(query string) map[string]string {
+	parsed := map[string]string{}
 	if query == "" {
-		return out
+		return parsed
 	}
 	for _, pair := range strings.Split(query, "&") {
 		if pair == "" {
@@ -74,149 +78,155 @@ func parseQuery(query string) map[string]string {
 		}
 		name = strings.ReplaceAll(name, "+", " ")
 		value = strings.ReplaceAll(value, "+", " ")
-		if d, err := url.QueryUnescape(name); err == nil {
-			name = d
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
 		}
-		if d, err := url.QueryUnescape(value); err == nil {
-			value = d
+		if decoded, err := url.QueryUnescape(value); err == nil {
+			value = decoded
 		}
-		if _, ok := out[name]; !ok {
-			out[name] = value
+		if _, taken := parsed[name]; !taken {
+			parsed[name] = value
 		}
 	}
-	return out
+	return parsed
 }
 
-// intQuery reads one query parameter as a positive integer, or the fallback.
-func intQuery(q map[string]string, name string, fallback int) int {
-	text, ok := q[name]
-	if !ok {
+// queryInt reads one query parameter as a positive integer, or falls
+// back when it is missing or not a plain positive number.
+func queryInt(params map[string]string, name string, fallback int) int {
+	text, present := params[name]
+	if !present {
 		return fallback
 	}
-	n := 0
+	value := 0
 	for i := 0; i < len(text); i++ {
 		if text[i] < '0' || text[i] > '9' {
 			return fallback
 		}
-		n = n*10 + int(text[i]-'0')
+		value = value*10 + int(text[i]-'0')
 	}
-	if n <= 0 {
+	if value <= 0 {
 		return fallback
 	}
-	return n
+	return value
 }
 
-// paginate slices a list by ?page / ?per_page (GitHub's defaults: 1, 30).
-func paginate[T any](list []T, q map[string]string) []T {
-	size := intQuery(q, "per_page", 30)
-	if size > 100 {
-		size = 100
+// paginateList slices a list by ?page / ?per_page, with GitHub's
+// defaults (page 1, 30 per page, capped at 100).
+func paginateList[T any](items []T, params map[string]string) []T {
+	pageSize := queryInt(params, "per_page", 30)
+	if pageSize > 100 {
+		pageSize = 100
 	}
-	page := intQuery(q, "page", 1)
-	start := (page - 1) * size
-	if start >= len(list) {
+	page := queryInt(params, "page", 1)
+	start := (page - 1) * pageSize
+	if start >= len(items) {
 		return []T{}
 	}
-	end := start + size
-	if end > len(list) {
-		end = len(list)
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
 	}
-	return list[start:end]
+	return items[start:end]
 }
 
-// readJSONBody parses the request body as a JSON object. An empty body
-// parses as an empty object; a non-empty body that is not a JSON object is
-// the protocol group's malformed-body case.
-func readJSONBody(req *Request) (map[string]any, bool) {
+// readObjectBody decodes the request body as a JSON object. An empty
+// body counts as an empty object; a non-empty body that does not decode
+// at all is the protocol group's malformed-body case, while one that
+// decodes to a non-object is treated as empty.
+func readObjectBody(req *ClientRequest) (map[string]any, bool) {
 	if len(req.Body) == 0 {
 		return map[string]any{}, true
 	}
-	v, ok := ParseJSON(req.Body)
+	value, ok := DecodeJSON(req.Body)
 	if !ok {
 		return nil, false
 	}
-	m, ok := v.(map[string]any)
-	if !ok {
+	asMap, isMap := value.(map[string]any)
+	if !isMap {
 		return map[string]any{}, true
 	}
-	return m, true
+	return asMap, true
 }
 
-// parseBodyJSON parses the body as any JSON value (GraphQL/MCP read their
-// own envelope).
-func parseBodyJSON(req *Request) (any, bool) {
+// readAnyBody decodes the body as an arbitrary JSON value; the GraphQL
+// and MCP surfaces read their own envelopes out of it.
+func readAnyBody(req *ClientRequest) (any, bool) {
 	if len(req.Body) == 0 {
 		return nil, false
 	}
-	return ParseJSON(req.Body)
+	return DecodeJSON(req.Body)
 }
 
 // ---------------------------------------------------------------------------
 // Memoised GET answers
 // ---------------------------------------------------------------------------
 
-type memoEntry struct {
-	bytes      []byte
+// memoSlot is one framed GET answer plus the offsets of the two fields
+// a replay must patch.
+type memoSlot struct {
+	framed     []byte
 	idOffset   int
 	dateOffset int
 }
 
 const (
-	maxMemoEntries = 1024
-	maxMemoBody    = 1024 * 1024
+	memoSlotCap  = 1024
+	memoBodyCap  = 1024 * 1024
 )
 
-// App is the whole forge application: one Vault, one memo store, one
-// read/write lock. Dispatches that cannot mutate the vault — every GET,
-// plus git-upload-pack POSTs (fetch and ls-refs only ever read objects
-// and refs, and write only to the answer caches) — run under the read
-// lock, so the 50-way concurrent clone workload overlaps instead of
-// queueing on one mutex: under the old serial dispatch a cache-hit fetch
-// waited ~200µs on average behind whichever request held the lock, and
-// that queue tail was most of the server-side cost clone had left.
-// Everything else takes the write lock, exactly as serial as before.
-// The shared pieces a read dispatch can touch are guarded individually:
-// the memo map and the git answer caches by their own mutexes, the
-// request-id and sequence counters atomically, and login adoption by
-// the vault's login lock.
-type App struct {
-	vault *Vault
-	mu    sync.RWMutex
+// Engine is the whole forge application: one Depot, one memo store and
+// one read/write lock. Dispatches that provably cannot mutate the
+// store — every GET, plus git-upload-pack POSTs (fetch and ls-refs
+// only ever read objects and refs, and write only to the answer
+// caches) — run under the read lock, so the 50-way concurrent clone
+// workload overlaps instead of queueing behind a single mutex: under
+// the old serial dispatch a cache-hit fetch waited ~200µs on average
+// behind whichever request held the lock, and that queue tail was most
+// of the server-side cost clone had left. Everything else takes the
+// write lock, exactly as serial as before. The shared pieces a read
+// dispatch can touch are guarded individually: the memo map and the
+// git answer caches by their own mutexes, the request-id and sequence
+// counters atomically, and login adoption by the depot's login lock.
+type Engine struct {
+	depot *Depot
+	gate  sync.RWMutex
 
 	memoMu   sync.Mutex
-	memo     map[string]*memoEntry
+	memo     map[string]*memoSlot
 	memoKey  string
-	memoLast *memoEntry
+	memoLast *memoSlot
 
-	gcache *gitCaches
+	answers *answerCache
 }
 
-func NewApp() *App {
-	return &App{
-		vault:  NewVault(),
-		memo:   map[string]*memoEntry{},
-		gcache: &gitCaches{answers: map[string][]byte{}, adverts: map[string][]byte{}},
+func NewEngine() *Engine {
+	return &Engine{
+		depot:   NewDepot(),
+		memo:    map[string]*memoSlot{},
+		answers: &answerCache{fetchAnswers: map[string][]byte{}, refAdverts: map[string][]byte{}},
 	}
 }
 
-func (a *App) forgetMemos() {
-	a.memoMu.Lock()
-	a.memo = map[string]*memoEntry{}
-	a.memoKey = ""
-	a.memoLast = nil
-	a.memoMu.Unlock()
+// dropMemos empties the whole memo store.
+func (e *Engine) dropMemos() {
+	e.memoMu.Lock()
+	e.memo = map[string]*memoSlot{}
+	e.memoKey = ""
+	e.memoLast = nil
+	e.memoMu.Unlock()
 }
 
-// memoKeyOf is everything a GET answer may depend on, beyond the store
-// the cache-clearing rule guards.
-func (a *App) memoKeyOf(req *Request) string {
+// memoKeyFor is everything a GET answer may depend on, beyond the
+// store state the cache-clearing rule guards.
+func (e *Engine) memoKeyFor(req *ClientRequest) string {
 	return req.Target + "\n" + req.Headers["authorization"] + "\n" +
-		req.Headers["git-protocol"] + "\n" + req.Headers["accept"] + "\n" + a.vault.LoginName()
+		req.Headers["git-protocol"] + "\n" + req.Headers["accept"] + "\n" + e.depot.AdoptedLogin()
 }
 
-// readOnlyDispatch reports whether a request provably cannot mutate the
-// vault: GETs, and git-upload-pack POSTs (fetch / ls-refs).
-func readOnlyDispatch(req *Request) bool {
+// dispatchIsReadOnly reports whether a request provably cannot mutate
+// the store: GETs, and git-upload-pack POSTs (fetch / ls-refs).
+func dispatchIsReadOnly(req *ClientRequest) bool {
 	if req.Method == "GET" {
 		return true
 	}
@@ -230,126 +240,128 @@ func readOnlyDispatch(req *Request) bool {
 	return strings.HasSuffix(path, "/git-upload-pack")
 }
 
-// Handle is the transport handler: dispatch with the memo fast path.
-func (a *App) Handle(req *Request, res *Response) {
-	started := time.Now()
-	readOnly := readOnlyDispatch(req)
+// Handle is the transport's entry point: dispatch, with the memo fast
+// path wrapped around it.
+func (e *Engine) Handle(req *ClientRequest, res *ClientResponse) {
+	startedAt := time.Now()
+	readOnly := dispatchIsReadOnly(req)
 	if readOnly {
-		a.mu.RLock()
+		e.gate.RLock()
 	} else {
-		a.mu.Lock()
+		e.gate.Lock()
 	}
-	held := time.Since(started)
+	waited := time.Since(startedAt)
 	defer func() {
 		if readOnly {
-			a.mu.RUnlock()
+			e.gate.RUnlock()
 		} else {
-			a.mu.Unlock()
+			e.gate.Unlock()
 		}
 	}()
 	defer func() {
-		if logMS {
-			fmt.Fprintf(os.Stderr, "[t] %s %s wait=%dµs hold=%dµs\n", req.Method, req.Target, held.Microseconds(), time.Since(started).Microseconds()-held.Microseconds())
+		if timingEnabled {
+			fmt.Fprintf(os.Stderr, "[t] %s %s wait=%dµs hold=%dµs\n", req.Method, req.Target, waited.Microseconds(), time.Since(startedAt).Microseconds()-waited.Microseconds())
 		}
 	}()
-	reqID := a.vault.NextRequestID()
-	res.SetHeader("x-github-request-id", reqID)
+	requestID := e.depot.MintRequestID()
+	res.SetHeader("x-github-request-id", requestID)
 
 	if req.Method == "GET" {
-		connHdr := strings.ToLower(req.Headers["connection"])
+		connectionHeader := strings.ToLower(req.Headers["connection"])
 		keepAlive := true
 		if req.Version == "1.0" {
-			keepAlive = connHdr == "keep-alive"
+			keepAlive = connectionHeader == "keep-alive"
 		} else {
-			keepAlive = connHdr != "close"
+			keepAlive = connectionHeader != "close"
 		}
-		key := a.memoKeyOf(req)
-		a.memoMu.Lock()
-		var hit *memoEntry
-		if key == a.memoKey {
-			hit = a.memoLast
+		key := e.memoKeyFor(req)
+		e.memoMu.Lock()
+		var slot *memoSlot
+		if key == e.memoKey {
+			slot = e.memoLast
 		} else {
-			hit = a.memo[key]
+			slot = e.memo[key]
 		}
-		if hit != nil {
-			a.memoKey = key
-			a.memoLast = hit
+		if slot != nil {
+			e.memoKey = key
+			e.memoLast = slot
 		}
-		a.memoMu.Unlock()
-		if hit != nil && keepAlive {
-			framed := make([]byte, len(hit.bytes))
-			copy(framed, hit.bytes)
-			if hit.idOffset >= 0 {
-				copy(framed[hit.idOffset:hit.idOffset+12], reqID)
+		e.memoMu.Unlock()
+		if slot != nil && keepAlive {
+			framed := make([]byte, len(slot.framed))
+			copy(framed, slot.framed)
+			if slot.idOffset >= 0 {
+				copy(framed[slot.idOffset:slot.idOffset+12], requestID)
 			}
-			if hit.dateOffset >= 0 {
-				copy(framed[hit.dateOffset:hit.dateOffset+29], CurrentDate())
+			if slot.dateOffset >= 0 {
+				copy(framed[slot.dateOffset:slot.dateOffset+29], CachedDateLine())
 			}
 			res.SendRaw(framed)
 			return
 		}
-		a.dispatch(req, res)
-		if res.Status < 500 && keepAlive && len(res.body) <= maxMemoBody && res.raw == nil {
-			head, idOff, dateOff := BuildHead(res.Status, res.headers, len(res.body), true)
-			framed := make([]byte, 0, len(head)+len(res.body))
+		e.route(req, res)
+		if res.Status < 500 && keepAlive && len(res.payload) <= memoBodyCap && res.prebuilt == nil {
+			head, idOff, dateOff := ComposeHead(res.Status, res.headerPairs, len(res.payload), true)
+			framed := make([]byte, 0, len(head)+len(res.payload))
 			framed = append(framed, head...)
-			framed = append(framed, res.body...)
-			entry := &memoEntry{bytes: framed, idOffset: idOff, dateOffset: dateOff}
-			a.memoMu.Lock()
-			if len(a.memo) >= maxMemoEntries {
-				a.memo = map[string]*memoEntry{}
+			framed = append(framed, res.payload...)
+			slot := &memoSlot{framed: framed, idOffset: idOff, dateOffset: dateOff}
+			e.memoMu.Lock()
+			if len(e.memo) >= memoSlotCap {
+				e.memo = map[string]*memoSlot{}
 			}
-			a.memo[key] = entry
-			a.memoKey = key
-			a.memoLast = entry
-			a.memoMu.Unlock()
+			e.memo[key] = slot
+			e.memoKey = key
+			e.memoLast = slot
+			e.memoMu.Unlock()
 		}
 		return
 	}
-	// A write anywhere can change any read; drop the whole cache before
-	// the write runs. Read-only POSTs (upload-pack) skip this: they are
-	// dispatched under the read lock and cannot change any state a memo
-	// captured. (Under the serial lock this branch also cleared the memo
-	// for fetches; that was pure waste — a fetch cannot invalidate a GET
-	// answer, and the next write clears it anyway.)
+	// A write anywhere can change any read, so the whole cache is
+	// dropped before the write runs. Read-only POSTs (upload-pack)
+	// skip this: they are dispatched under the read lock and cannot
+	// change any state a memo captured. (Under the serial lock this
+	// branch cleared the memo for fetches too; that was pure waste — a
+	// fetch cannot invalidate a GET answer, and the next write clears
+	// it anyway.)
 	if !readOnly {
-		a.forgetMemos()
+		e.dropMemos()
 	}
-	a.dispatch(req, res)
+	e.route(req, res)
 }
 
-// dispatch routes one request to its surface.
-func (a *App) dispatch(req *Request, res *Response) {
-	verb := req.Method
-	segments, queryText := splitTarget(req.Target)
-	query := parseQuery(queryText)
+// route sends one request to its surface.
+func (e *Engine) route(req *ClientRequest, res *ClientResponse) {
+	segments, queryText := splitRequestTarget(req.Target)
+	params := parseQueryString(queryText)
 
-	// The env's boot check calls this twice: 200 {"ok":true}.
-	if verb == "GET" && len(segments) == 1 && segments[0] == "healthz" {
+	// The environment's boot check calls this twice and expects
+	// 200 {"ok":true}.
+	if req.Method == "GET" && len(segments) == 1 && segments[0] == "healthz" {
 		res.SendJSON(200, map[string]any{"ok": true})
 		return
 	}
 
 	if len(segments) >= 2 && segments[0] == "api" && segments[1] == "v3" {
-		a.handleRest(req, res, query, segments[2:])
+		e.serveREST(req, res, params, segments[2:])
 		return
 	}
 	if len(segments) == 2 && segments[0] == "api" && segments[1] == "graphql" {
-		if verb != "POST" {
+		if req.Method != "POST" {
 			res.SendError(404, "Not Found")
 			return
 		}
-		a.handleGraphQL(req, res)
+		e.serveGraphQL(req, res)
 		return
 	}
 	if len(segments) == 1 && segments[0] == "mcp" {
-		a.handleMCP(req, res)
+		e.serveMCP(req, res)
 		return
 	}
-	if a.handleGit(req, res, query, segments) {
+	if e.serveGit(req, res, params, segments) {
 		return
 	}
 
-	// Everything else, every method: GitHub's 404 body.
+	// Everything else, whatever the method: GitHub's 404 body.
 	res.SendError(404, "Not Found")
 }

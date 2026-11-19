@@ -1,14 +1,16 @@
-// The forge's in-memory vault: the git object store (SHA-1 addressed
-// blobs, trees, commits and tags), the repositories built on it, and the
-// issue / pull-request domain the REST, GraphQL and MCP surfaces share.
-// One vault serves every surface, so an object created through any of
-// them is the same object through the others.
+// The forge's memory: one git object store (blobs, trees, commits
+// and tags, each addressed by its SHA-1) with the repositories built
+// on top of it, plus the issue and pull-request domain that the REST,
+// GraphQL and MCP surfaces all share. There is exactly one store per
+// process, so an object brought into being through any surface is the
+// same object through all of them.
 //
-// Nothing here reads the wall clock or a random source: timestamps come
-// from a monotonic sequence laid over a fixed base epoch, ids from
-// counters, and request ids from a counter too. State is therefore a pure
-// function of the request sequence, which is what a trial's live pass and
-// its replay both need.
+// Determinism is a design rule here, not an accident: nothing reads
+// the wall clock or a random source. Timestamps are a monotonic
+// counter laid over a fixed base epoch, ids come from counters, and
+// even request ids are counter output. The store's state is therefore
+// a pure function of the sequence of requests it has served, which is
+// precisely what a trial's live pass and its replay both require.
 
 package main
 
@@ -23,133 +25,145 @@ import (
 	"time"
 )
 
-type ObjType int
+// ObjectKind distinguishes the four kinds of git object.
+type ObjectKind int
 
 const (
-	ObjCommit ObjType = 1
-	ObjTree   ObjType = 2
-	ObjBlob   ObjType = 3
-	ObjTag    ObjType = 4
+	KindCommit ObjectKind = 1
+	KindTree   ObjectKind = 2
+	KindBlob   ObjectKind = 3
+	KindTag    ObjectKind = 4
 )
 
-func (t ObjType) Name() string {
-	switch t {
-	case ObjCommit:
+// Name is the word git itself uses for the kind, as it appears in
+// object headers.
+func (k ObjectKind) Name() string {
+	switch k {
+	case KindCommit:
 		return "commit"
-	case ObjTree:
+	case KindTree:
 		return "tree"
-	case ObjBlob:
+	case KindBlob:
 		return "blob"
 	default:
 		return "tag"
 	}
 }
 
-type GitObj struct {
-	Type ObjType
-	Data []byte
+// GitObject is one stored object: its kind and its raw bytes.
+type GitObject struct {
+	Kind ObjectKind
+	Raw  []byte
 }
 
+// ZeroOID is the all-zero object id git uses for "no object".
 const ZeroOID = "0000000000000000000000000000000000000000"
 
+// baseEpochSec anchors the deterministic clock: sequence number n
+// corresponds to baseEpochSec + n.
 const baseEpochSec = 1700000000
 
-// HashObject returns the SHA-1 of a git object: "<type> <len>\0" + bytes.
-func HashObject(typ ObjType, data []byte) string {
-	h := sha1.New()
-	h.Write([]byte(typ.Name() + " " + strconv.Itoa(len(data)) + "\x00"))
-	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+// HashGitObject computes an object's id: the SHA-1 of the header
+// "<kind> <length>\0" followed by the raw bytes.
+func HashGitObject(kind ObjectKind, raw []byte) string {
+	digest := sha1.New()
+	digest.Write([]byte(kind.Name() + " " + strconv.Itoa(len(raw)) + "\x00"))
+	digest.Write(raw)
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
-type TreeEntry struct {
+// TreeRow is one entry of a tree object.
+type TreeRow struct {
 	Mode string
 	Name string
 	OID  string
 }
 
-// ParseTree splits a tree object's raw bytes into entries, in stored order.
-func ParseTree(data []byte) []TreeEntry {
-	var rows []TreeEntry
-	pos := 0
-	for pos < len(data) {
-		sp := indexByte(data, ' ', pos)
-		if sp < 0 {
+// SplitTreeBytes decodes a tree object's raw bytes into its rows, in
+// the order they are stored.
+func SplitTreeBytes(raw []byte) []TreeRow {
+	var rows []TreeRow
+	at := 0
+	for at < len(raw) {
+		space := findByteFrom(raw, ' ', at)
+		if space < 0 {
 			break
 		}
-		nul := indexByte(data, 0, sp)
-		if nul < 0 || nul+21 > len(data) {
+		nul := findByteFrom(raw, 0, space)
+		if nul < 0 || nul+21 > len(raw) {
 			break
 		}
-		rows = append(rows, TreeEntry{
-			Mode: string(data[pos:sp]),
-			Name: string(data[sp+1 : nul]),
-			OID:  hex.EncodeToString(data[nul+1 : nul+21]),
+		rows = append(rows, TreeRow{
+			Mode: string(raw[at:space]),
+			Name: string(raw[space+1 : nul]),
+			OID:  hex.EncodeToString(raw[nul+1 : nul+21]),
 		})
-		pos = nul + 21
+		at = nul + 21
 	}
 	return rows
 }
 
-func indexByte(b []byte, c byte, from int) int {
-	for i := from; i < len(b); i++ {
-		if b[i] == c {
+func findByteFrom(haystack []byte, needle byte, from int) int {
+	for i := from; i < len(haystack); i++ {
+		if haystack[i] == needle {
 			return i
 		}
 	}
 	return -1
 }
 
-func treeSortKey(e TreeEntry) string {
-	if e.Mode == "40000" || e.Mode == "040000" {
-		return e.Name + "/"
+// treeOrderKey is the sort key git applies to a tree row: directories
+// sort as if their name ended in a slash.
+func treeOrderKey(row TreeRow) string {
+	if row.Mode == "40000" || row.Mode == "040000" {
+		return row.Name + "/"
 	}
-	return e.Name
+	return row.Name
 }
 
-// BuildTree serializes tree entries into a tree object's raw bytes,
-// sorted the way git sorts them.
-func BuildTree(entries []TreeEntry) []byte {
-	ordered := make([]TreeEntry, len(entries))
-	copy(ordered, entries)
+// SerializeTree renders rows as a tree object's raw bytes, ordered the
+// way git orders them.
+func SerializeTree(rows []TreeRow) []byte {
+	ordered := make([]TreeRow, len(rows))
+	copy(ordered, rows)
 	for i := 1; i < len(ordered); i++ {
-		for j := i; j > 0 && treeSortKey(ordered[j]) < treeSortKey(ordered[j-1]); j-- {
+		for j := i; j > 0 && treeOrderKey(ordered[j]) < treeOrderKey(ordered[j-1]); j-- {
 			ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
 		}
 	}
 	var out []byte
-	for _, e := range ordered {
-		out = append(out, []byte(e.Mode+" "+e.Name+"\x00")...)
-		raw, _ := hex.DecodeString(e.OID)
-		out = append(out, raw...)
+	for _, row := range ordered {
+		out = append(out, []byte(row.Mode+" "+row.Name+"\x00")...)
+		binary, _ := hex.DecodeString(row.OID)
+		out = append(out, binary...)
 	}
 	return out
 }
 
-type CommitInfo struct {
-	Tree      string
-	Parents   []string
-	Author    string
-	Committer string
-	Message   string
+// CommitHead is the decoded header of a commit object.
+type CommitHead struct {
+	TreeOID       string
+	ParentOIDs    []string
+	AuthorLine    string
+	CommitterLine string
+	MessageBody   string
 }
 
-// ParseCommit reads a commit object's headers and message. Only the header
-// block is turned into text; the message is sliced off the raw bytes.
-// CommitParents scans only the parent lines of a commit header — the
-// cheap shape test the push fast-forward fast path needs, without
-// ParseCommit's full ident/message decoding.
-func CommitParents(data []byte) []string {
+// ScanParentLines reads just the parent lines out of a commit header.
+// The push fast path needs this cheap shape test without paying for a
+// full header decode.
+func ScanParentLines(raw []byte) []string {
 	var parents []string
-	for len(data) > 0 {
+	rest := raw
+	for len(rest) > 0 {
 		var line []byte
-		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			line, data = data[:i], data[i+1:]
+		if cut := bytes.IndexByte(rest, '\n'); cut >= 0 {
+			line, rest = rest[:cut], rest[cut+1:]
 		} else {
-			line, data = data, nil
+			line, rest = rest, nil
 		}
 		if len(line) == 0 {
-			break // blank line: header over
+			break // the blank line ends the header block
 		}
 		if bytes.HasPrefix(line, []byte("parent ")) && len(line) == 47 {
 			parents = append(parents, string(line[7:]))
@@ -158,42 +172,42 @@ func CommitParents(data []byte) []string {
 	return parents
 }
 
-func ParseCommit(data []byte) CommitInfo {
-	var info CommitInfo
-	split := -1
-	for i := 0; i+1 < len(data); i++ {
-		if data[i] == '\n' && data[i+1] == '\n' {
-			split = i
+// DecodeCommit splits a commit object into its header fields and its
+// message. Only the header block is treated as text; the message is
+// cut from the raw bytes after the blank line.
+func DecodeCommit(raw []byte) CommitHead {
+	var head CommitHead
+	blank := -1
+	for i := 0; i+1 < len(raw); i++ {
+		if raw[i] == '\n' && raw[i+1] == '\n' {
+			blank = i
 			break
 		}
 	}
-	var header, body string
-	if split == -1 {
-		header = string(data)
-	} else {
-		header = string(data[:split])
-		body = string(data[split+2:])
+	headerText := string(raw)
+	if blank >= 0 {
+		headerText = string(raw[:blank])
+		head.MessageBody = string(raw[blank+2:])
 	}
-	info.Message = body
-	for _, line := range strings.Split(header, "\n") {
+	for _, line := range strings.Split(headerText, "\n") {
 		switch {
 		case strings.HasPrefix(line, "tree "):
-			info.Tree = strings.TrimSpace(line[5:])
+			head.TreeOID = strings.TrimSpace(line[5:])
 		case strings.HasPrefix(line, "parent "):
-			info.Parents = append(info.Parents, strings.TrimSpace(line[7:]))
+			head.ParentOIDs = append(head.ParentOIDs, strings.TrimSpace(line[7:]))
 		case strings.HasPrefix(line, "author "):
-			info.Author = line[7:]
+			head.AuthorLine = line[7:]
 		case strings.HasPrefix(line, "committer "):
-			info.Committer = line[10:]
+			head.CommitterLine = line[10:]
 		}
 	}
-	return info
+	return head
 }
 
-// ParseTagTarget returns the `object` header of an annotated tag.
-func ParseTagTarget(data []byte) string {
-	text := string(data)
-	for _, line := range strings.Split(text, "\n") {
+// TagTargetOID returns the object a tag object points at, from its
+// `object` header.
+func TagTargetOID(raw []byte) string {
+	for _, line := range strings.Split(string(raw), "\n") {
 		if line == "" {
 			break
 		}
@@ -204,35 +218,37 @@ func ParseTagTarget(data []byte) string {
 	return ""
 }
 
-type identParts struct {
-	name  string
-	email string
-	epoch int64
+// identPieces is one git identity line taken apart.
+type identPieces struct {
+	displayName string
+	mailbox     string
+	epochSec    int64
 }
 
-// ParseIdent splits "Name <email> 1700000000 +0000" into its parts.
-func ParseIdent(line string) identParts {
+// SplitIdentLine parses "Name <email> 1700000000 +0000".
+func SplitIdentLine(line string) identPieces {
 	line = strings.TrimSpace(line)
-	lt := strings.Index(line, "<")
-	gt := strings.Index(line, ">")
-	if lt < 0 || gt < 0 || gt < lt {
-		return identParts{name: line, epoch: baseEpochSec}
+	open := strings.Index(line, "<")
+	close := strings.Index(line, ">")
+	if open < 0 || close < 0 || close < open {
+		return identPieces{displayName: line, epochSec: baseEpochSec}
 	}
-	name := strings.TrimSpace(line[:lt])
-	email := line[lt+1 : gt]
-	rest := strings.Fields(line[gt+1:])
-	var epoch int64 = baseEpochSec
-	if len(rest) > 0 {
-		if n, err := strconv.ParseInt(rest[0], 10, 64); err == nil {
+	epoch := int64(baseEpochSec)
+	if tail := strings.Fields(line[close+1:]); len(tail) > 0 {
+		if n, err := strconv.ParseInt(tail[0], 10, 64); err == nil {
 			epoch = n
 		}
 	}
-	return identParts{name: name, email: email, epoch: epoch}
+	return identPieces{
+		displayName: strings.TrimSpace(line[:open]),
+		mailbox:     line[open+1 : close],
+		epochSec:    epoch,
+	}
 }
 
-// ISOAt renders epoch seconds as an ISO-8601 timestamp, byte-identical
-// to Date.toISOString for whole seconds ("...T...:....000Z").
-func ISOAt(epochSec int64) string {
+// FormatISOSecond renders epoch seconds as an ISO-8601 timestamp that
+// matches Date.toISOString byte for byte at whole-second precision.
+func FormatISOSecond(epochSec int64) string {
 	return time.Unix(epochSec, 0).UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
@@ -240,28 +256,31 @@ func ISOAt(epochSec int64) string {
 // Domain records
 // ---------------------------------------------------------------------------
 
-type CommentRec struct {
-	ID   int
-	Body string
-	Seq  int64
-}
-
-type IssueRec struct {
-	Number   int
+// CommentRecord is one comment on an issue or a pull request.
+type CommentRecord struct {
 	ID       int
-	Title    string
-	Body     string
-	State    string // "open" | "closed"
-	Labels   []string
-	Comments []*CommentRec
-	Seq      int64
+	BodyText string
+	SeqNo    int64
 }
 
-type PullRec struct {
+// IssueRecord is one issue in a repository.
+type IssueRecord struct {
+	Number     int
+	ID         int
+	Title      string
+	BodyText   string
+	State      string // "open" | "closed"
+	LabelNames []string
+	Comments   []*CommentRecord
+	SeqNo      int64
+}
+
+// PullRecord is one pull request in a repository.
+type PullRecord struct {
 	Number         int
 	ID             int
 	Title          string
-	Body           string
+	BodyText       string
 	State          string // "open" | "closed"
 	Merged         bool
 	HeadRef        string
@@ -270,142 +289,166 @@ type PullRec struct {
 	BaseSHA        string
 	MergeCommitSHA string
 	MergedSeq      int64
-	Comments       []*CommentRec
-	Seq            int64
+	Comments       []*CommentRecord
+	SeqNo          int64
 }
 
-type LabelRec struct {
+// LabelRecord is one label a repository defines.
+type LabelRecord struct {
 	Name  string
 	Color string
 }
 
-type Repo struct {
+// Repository is the state of one repository: its refs plus the issue
+// and pull-request domain layered over them.
+type Repository struct {
 	ID            int
 	Name          string
 	Description   string
 	Private       bool
 	DefaultBranch string
 	Refs          map[string]string // full ref name -> commit oid
-	Labels        map[string]*LabelRec
-	Issues        map[int]*IssueRec
-	Pulls         map[int]*PullRec
+	Labels        map[string]*LabelRecord
+	Issues        map[int]*IssueRecord
+	Pulls         map[int]*PullRecord
 	NextNumber    int
-	Seq           int64
+	SeqNo         int64
 }
 
-// PathHit is what a path inside a tree resolves to.
-type PathHit struct {
+// FileEntry is one file of a flattened tree: blob oid plus mode.
+type FileEntry struct {
+	OID  string
+	Mode string
+}
+
+// FileMap flattens a whole tree into path -> FileEntry.
+type FileMap map[string]FileEntry
+
+// PathMatch is the resolution of one path inside a tree: either a file
+// (with its bytes) or a directory (with its rows).
+type PathMatch struct {
 	Kind    string // "file" | "dir"
 	OID     string
-	Data    []byte
+	Raw     []byte
 	Mode    string
-	Entries []TreeEntry
+	Entries []TreeRow
 }
 
 // ---------------------------------------------------------------------------
-// Vault
+// The store itself
 // ---------------------------------------------------------------------------
 
-type Vault struct {
-	Objects      map[string]*GitObj
-	Repos        map[string]*Repo
-	Login        string
-	HasLogin     bool
-	loginMu      sync.RWMutex
-	tick         int64
-	nextRepoID   int
-	nextIssueID  int
-	nextCmtID    int
-	nextReqNo    int64
+// Depot is the single in-memory store behind every surface.
+type Depot struct {
+	ObjectMap   map[string]*GitObject
+	RepoMap     map[string]*Repository
+	login       string
+	hasLogin    bool
+	loginLock   sync.RWMutex
+	counter     int64
+	repoSeq     int
+	issueSeq    int
+	commentSeq  int
+	requestSeq  int64
 }
 
-func NewVault() *Vault {
-	return &Vault{
-		Objects: map[string]*GitObj{},
-		Repos:   map[string]*Repo{},
+func NewDepot() *Depot {
+	return &Depot{
+		ObjectMap: map[string]*GitObject{},
+		RepoMap:   map[string]*Repository{},
 	}
 }
 
-// Seq returns the next deterministic sequence number. Atomic so read-only
-// dispatches running in parallel can never tear the counter; the values
-// handed out under parallel dispatch may interleave differently than a
-// serial run would, but every value is still unique and monotonic.
-func (v *Vault) Seq() int64 {
-	return atomic.AddInt64(&v.tick, 1)
+// NextSeq hands out the next deterministic sequence number. It is
+// atomic because read-only dispatches run in parallel and must never
+// tear the counter; under parallel dispatch the values may interleave
+// differently than a serial run's would, but each stays unique and the
+// sequence stays monotonic.
+func (d *Depot) NextSeq() int64 {
+	return atomic.AddInt64(&d.counter, 1)
 }
 
-func (v *Vault) ISOAtSeq(seq int64) string { return ISOAt(baseEpochSec + seq) }
-func (v *Vault) EpochAt(seq int64) int64   { return baseEpochSec + seq }
+// ISOForSeq renders the timestamp a sequence number stands for.
+func (d *Depot) ISOForSeq(seq int64) string { return FormatISOSecond(baseEpochSec + seq) }
 
-// NextRequestID mints a fixed-width id ("FORGE-" + 6 base-36 digits) so a
-// memoised response head can be patched with a fresh id in place.
-func (v *Vault) NextRequestID() string {
-	n := int(atomic.AddInt64(&v.nextReqNo, 1))
-	const digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	var rev [6]byte
+// EpochForSeq is ISOForSeq in epoch seconds.
+func (d *Depot) EpochForSeq(seq int64) int64 { return baseEpochSec + seq }
+
+// MintRequestID builds a fixed-width request id ("FORGE-" plus six
+// base-36 digits). The fixed width matters: a memoised response head
+// gets a fresh id patched into it in place.
+func (d *Depot) MintRequestID() string {
+	n := int(atomic.AddInt64(&d.requestSeq, 1))
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	var reversed [6]byte
 	for i := 5; i >= 0; i-- {
-		rev[i] = digits[n%36]
+		reversed[i] = alphabet[n%36]
 		n /= 36
 	}
-	return "FORGE-" + string(rev[:])
+	return "FORGE-" + string(reversed[:])
 }
 
-// AdoptLogin learns the token owner's login from the first owner-bearing
-// request; after that the login is fixed for the life of the process.
-func (v *Vault) AdoptLogin(owner string) {
+// LearnLogin adopts the token owner's login from the first request
+// that carries an owner; from then on the login is fixed for the life
+// of the process.
+func (d *Depot) LearnLogin(owner string) {
 	if owner == "" {
 		return
 	}
-	v.loginMu.Lock()
-	if !v.HasLogin {
-		v.Login = owner
-		v.HasLogin = true
+	d.loginLock.Lock()
+	if !d.hasLogin {
+		d.login = owner
+		d.hasLogin = true
 	}
-	v.loginMu.Unlock()
+	d.loginLock.Unlock()
 }
 
-// OwnerMatches reports whether `owner` is (or could still become) the
-// token owner's login.
-func (v *Vault) OwnerMatches(owner string) bool {
-	v.loginMu.RLock()
-	defer v.loginMu.RUnlock()
-	return !v.HasLogin || v.Login == owner
+// LoginCouldBe reports whether owner is the adopted login, or could
+// still become it because none has been adopted yet.
+func (d *Depot) LoginCouldBe(owner string) bool {
+	d.loginLock.RLock()
+	defer d.loginLock.RUnlock()
+	return !d.hasLogin || d.login == owner
 }
 
-// LoginName returns the adopted login ("" before adoption).
-func (v *Vault) LoginName() string {
-	v.loginMu.RLock()
-	defer v.loginMu.RUnlock()
-	return v.Login
+// AdoptedLogin returns the adopted login ("" before adoption).
+func (d *Depot) AdoptedLogin() string {
+	d.loginLock.RLock()
+	defer d.loginLock.RUnlock()
+	return d.login
 }
 
 // ---------------------------------------------------------------------------
-// Object store
+// Object storage and graph walks
 // ---------------------------------------------------------------------------
 
-func (v *Vault) PutObject(typ ObjType, data []byte) string {
-	oid := HashObject(typ, data)
-	if _, ok := v.Objects[oid]; !ok {
-		v.Objects[oid] = &GitObj{Type: typ, Data: data}
+// StoreObject writes an object if its id is not already present and
+// returns the id either way.
+func (d *Depot) StoreObject(kind ObjectKind, raw []byte) string {
+	oid := HashGitObject(kind, raw)
+	if _, present := d.ObjectMap[oid]; !present {
+		d.ObjectMap[oid] = &GitObject{Kind: kind, Raw: raw}
 	}
 	return oid
 }
 
-func (v *Vault) GetObject(oid string) *GitObj { return v.Objects[oid] }
+// FetchObject returns the object under an id, or nil.
+func (d *Depot) FetchObject(oid string) *GitObject { return d.ObjectMap[oid] }
 
-// PeelToCommit follows tag objects to the commit they ultimately name.
-func (v *Vault) PeelToCommit(oid string) (string, bool) {
-	cur := oid
-	for i := 0; i < 16; i++ {
-		obj := v.Objects[cur]
+// FollowToCommit peels tag objects until it reaches the commit they
+// ultimately name.
+func (d *Depot) FollowToCommit(oid string) (string, bool) {
+	current := oid
+	for hop := 0; hop < 16; hop++ {
+		obj := d.ObjectMap[current]
 		if obj == nil {
 			return "", false
 		}
-		switch obj.Type {
-		case ObjCommit:
-			return cur, true
-		case ObjTag:
-			cur = ParseTagTarget(obj.Data)
+		switch obj.Kind {
+		case KindCommit:
+			return current, true
+		case KindTag:
+			current = TagTargetOID(obj.Raw)
 		default:
 			return "", false
 		}
@@ -413,784 +456,764 @@ func (v *Vault) PeelToCommit(oid string) (string, bool) {
 	return "", false
 }
 
-// Reachable returns every object reachable from the given tips.
-func (v *Vault) Reachable(tips []string) map[string]bool {
-	seen := map[string]bool{}
-	pending := append([]string{}, tips...)
-	for len(pending) > 0 {
-		cur := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		if seen[cur] {
+// ReachableSet returns every object reachable from the given tips.
+func (d *Depot) ReachableSet(tips []string) map[string]bool {
+	found := map[string]bool{}
+	stack := append([]string{}, tips...)
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if found[current] {
 			continue
 		}
-		obj := v.Objects[cur]
+		obj := d.ObjectMap[current]
 		if obj == nil {
 			continue
 		}
-		seen[cur] = true
-		switch obj.Type {
-		case ObjCommit:
-			info := ParseCommit(obj.Data)
-			pending = append(pending, info.Tree)
-			pending = append(pending, info.Parents...)
-		case ObjTree:
-			for _, e := range ParseTree(obj.Data) {
-				pending = append(pending, e.OID)
+		found[current] = true
+		switch obj.Kind {
+		case KindCommit:
+			head := DecodeCommit(obj.Raw)
+			stack = append(stack, head.TreeOID)
+			stack = append(stack, head.ParentOIDs...)
+		case KindTree:
+			for _, row := range SplitTreeBytes(obj.Raw) {
+				stack = append(stack, row.OID)
 			}
-		case ObjTag:
-			pending = append(pending, ParseTagTarget(obj.Data))
+		case KindTag:
+			stack = append(stack, TagTargetOID(obj.Raw))
 		}
 	}
-	return seen
+	return found
 }
 
-// IsAncestor reports whether ancestor is descendant itself or one of its
-// ancestors.
-func (v *Vault) IsAncestor(ancestor, descendant string) bool {
-	seen := map[string]bool{}
-	pending := []string{descendant}
-	for len(pending) > 0 {
-		cur := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		if cur == ancestor {
+// IsAncestorOf reports whether ancestor is the descendant itself or
+// one of its ancestors.
+func (d *Depot) IsAncestorOf(ancestor, descendant string) bool {
+	visited := map[string]bool{}
+	stack := []string{descendant}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if current == ancestor {
 			return true
 		}
-		if seen[cur] {
+		if visited[current] {
 			continue
 		}
-		seen[cur] = true
-		if obj := v.Objects[cur]; obj != nil && obj.Type == ObjCommit {
-			pending = append(pending, ParseCommit(obj.Data).Parents...)
+		visited[current] = true
+		if obj := d.ObjectMap[current]; obj != nil && obj.Kind == KindCommit {
+			stack = append(stack, DecodeCommit(obj.Raw).ParentOIDs...)
 		}
 	}
 	return false
 }
 
-// MergeBase finds a best common ancestor of two commits (breadth-first
-// from both sides), or "" when there is none.
-func (v *Vault) MergeBase(a, b string) string {
+// CommonAncestor finds a best common ancestor of two commits by
+// breadth-first search from both sides, or "" when there is none.
+func (d *Depot) CommonAncestor(a, b string) string {
 	if a == b {
 		return a
 	}
-	depthA := map[string]int{}
-	frontier := [][2]any{{a, 0}}
-	for head := 0; head < len(frontier); head++ {
-		cur := frontier[head][0].(string)
-		dist := frontier[head][1].(int)
-		if _, ok := depthA[cur]; ok {
+	type frontierItem struct {
+		oid   string
+		depth int
+	}
+	depthFromA := map[string]int{}
+	queueA := []frontierItem{{a, 0}}
+	for head := 0; head < len(queueA); head++ {
+		item := queueA[head]
+		if _, seen := depthFromA[item.oid]; seen {
 			continue
 		}
-		depthA[cur] = dist
-		if obj := v.Objects[cur]; obj != nil && obj.Type == ObjCommit {
-			for _, p := range ParseCommit(obj.Data).Parents {
-				frontier = append(frontier, [2]any{p, dist + 1})
+		depthFromA[item.oid] = item.depth
+		if obj := d.ObjectMap[item.oid]; obj != nil && obj.Kind == KindCommit {
+			for _, parent := range DecodeCommit(obj.Raw).ParentOIDs {
+				queueA = append(queueA, frontierItem{parent, item.depth + 1})
 			}
 		}
 	}
-	seenB := map[string]bool{}
-	frontierB := [][2]any{{b, 0}}
-	winner := ""
-	best := int(^uint(0) >> 1)
-	for head := 0; head < len(frontierB); head++ {
-		cur := frontierB[head][0].(string)
-		dist := frontierB[head][1].(int)
-		if seenB[cur] {
+	visitedB := map[string]bool{}
+	queueB := []frontierItem{{b, 0}}
+	best := ""
+	bestScore := int(^uint(0) >> 1)
+	for head := 0; head < len(queueB); head++ {
+		item := queueB[head]
+		if visitedB[item.oid] {
 			continue
 		}
-		seenB[cur] = true
-		if dA, ok := depthA[cur]; ok && dA+dist < best {
-			winner = cur
-			best = dA + dist
+		visitedB[item.oid] = true
+		if da, ok := depthFromA[item.oid]; ok && da+item.depth < bestScore {
+			best = item.oid
+			bestScore = da + item.depth
 		}
-		if obj := v.Objects[cur]; obj != nil && obj.Type == ObjCommit {
-			for _, p := range ParseCommit(obj.Data).Parents {
-				frontierB = append(frontierB, [2]any{p, dist + 1})
+		if obj := d.ObjectMap[item.oid]; obj != nil && obj.Kind == KindCommit {
+			for _, parent := range DecodeCommit(obj.Raw).ParentOIDs {
+				queueB = append(queueB, frontierItem{parent, item.depth + 1})
 			}
 		}
 	}
-	return winner
+	return best
 }
 
-// History returns the commits reachable from a tip, newest first
-// (depth-first in parent order).
-func (v *Vault) History(tip string) []string {
-	var out []string
-	seen := map[string]bool{}
-	var walk func(cur string)
-	walk = func(cur string) {
-		if seen[cur] {
+// HistoryFrom returns the commits reachable from a tip, newest first
+// (depth-first, following parents in order).
+func (d *Depot) HistoryFrom(tip string) []string {
+	var ordered []string
+	visited := map[string]bool{}
+	var descend func(current string)
+	descend = func(current string) {
+		if visited[current] {
 			return
 		}
-		obj := v.Objects[cur]
-		if obj == nil || obj.Type != ObjCommit {
+		obj := d.ObjectMap[current]
+		if obj == nil || obj.Kind != KindCommit {
 			return
 		}
-		seen[cur] = true
-		out = append(out, cur)
-		for _, p := range ParseCommit(obj.Data).Parents {
-			walk(p)
+		visited[current] = true
+		ordered = append(ordered, current)
+		for _, parent := range DecodeCommit(obj.Raw).ParentOIDs {
+			descend(parent)
 		}
 	}
-	walk(tip)
-	return out
+	descend(tip)
+	return ordered
 }
 
 // ---------------------------------------------------------------------------
 // Trees and files
 // ---------------------------------------------------------------------------
 
-// TreeFiles flattens a tree (recursively) into a path -> blob map.
-func (v *Vault) TreeFiles(treeOID string) map[string]struct {
-	OID  string
-	Mode string
-} {
-	flat := map[string]struct {
-		OID  string
-		Mode string
-	}{}
-	var walk func(tree, prefix string)
-	walk = func(tree, prefix string) {
-		obj := v.Objects[tree]
-		if obj == nil || obj.Type != ObjTree {
+// FlattenTree flattens a tree, recursively, into a path -> FileEntry
+// map.
+func (d *Depot) FlattenTree(treeOID string) FileMap {
+	flat := FileMap{}
+	var descend func(tree, prefix string)
+	descend = func(tree, prefix string) {
+		obj := d.ObjectMap[tree]
+		if obj == nil || obj.Kind != KindTree {
 			return
 		}
-		for _, e := range ParseTree(obj.Data) {
-			full := e.Name
+		for _, row := range SplitTreeBytes(obj.Raw) {
+			full := row.Name
 			if prefix != "" {
-				full = prefix + "/" + e.Name
+				full = prefix + "/" + row.Name
 			}
-			if e.Mode == "40000" || e.Mode == "040000" {
-				walk(e.OID, full)
+			if row.Mode == "40000" || row.Mode == "040000" {
+				descend(row.OID, full)
 			} else {
-				flat[full] = struct {
-					OID  string
-					Mode string
-				}{e.OID, e.Mode}
+				flat[full] = FileEntry{OID: row.OID, Mode: row.Mode}
 			}
 		}
 	}
-	walk(treeOID, "")
+	descend(treeOID, "")
 	return flat
 }
 
-// CommitFiles returns the flattened file map of a commit's tree.
-func (v *Vault) CommitFiles(commitOID string) map[string]struct {
-	OID  string
-	Mode string
-} {
-	obj := v.Objects[commitOID]
-	if obj == nil || obj.Type != ObjCommit {
-		return map[string]struct {
-			OID  string
-			Mode string
-		}{}
+// FlattenCommit flattens the tree of the commit under an id.
+func (d *Depot) FlattenCommit(commitOID string) FileMap {
+	obj := d.ObjectMap[commitOID]
+	if obj == nil || obj.Kind != KindCommit {
+		return FileMap{}
 	}
-	return v.TreeFiles(ParseCommit(obj.Data).Tree)
+	return d.FlattenTree(DecodeCommit(obj.Raw).TreeOID)
 }
 
-// TreeFromFiles builds (and stores) a tree hierarchy holding exactly the
-// given path -> blob map.
-func (v *Vault) TreeFromFiles(files map[string]struct {
-	OID  string
-	Mode string
-}) string {
-	type node struct {
-		files map[string]struct {
-			OID  string
-			Mode string
-		}
-		dirs map[string]*node
+// BuildTreeFromFiles stores a tree hierarchy holding exactly the given
+// flattened file map and returns the root tree's id.
+func (d *Depot) BuildTreeFromFiles(files FileMap) string {
+	type treeBuilderNode struct {
+		leafFiles map[string]FileEntry
+		subDirs   map[string]*treeBuilderNode
 	}
-	newNode := func() *node {
-		return &node{
-			files: map[string]struct {
-				OID  string
-				Mode string
-			}{},
-			dirs: map[string]*node{},
+	freshNode := func() *treeBuilderNode {
+		return &treeBuilderNode{
+			leafFiles: map[string]FileEntry{},
+			subDirs:   map[string]*treeBuilderNode{},
 		}
 	}
-	root := newNode()
-	for path, rec := range files {
-		parts := strings.Split(path, "/")
-		cur := root
-		for i := 0; i < len(parts)-1; i++ {
-			seg := parts[i]
-			if _, ok := cur.dirs[seg]; !ok {
-				cur.dirs[seg] = newNode()
+	root := freshNode()
+	for path, entry := range files {
+		segments := strings.Split(path, "/")
+		node := root
+		for i := 0; i < len(segments)-1; i++ {
+			seg := segments[i]
+			if _, ok := node.subDirs[seg]; !ok {
+				node.subDirs[seg] = freshNode()
 			}
-			cur = cur.dirs[seg]
+			node = node.subDirs[seg]
 		}
-		cur.files[parts[len(parts)-1]] = rec
+		node.leafFiles[segments[len(segments)-1]] = entry
 	}
-	var emit func(n *node) string
-	emit = func(n *node) string {
-		var rows []TreeEntry
-		for name, rec := range n.files {
-			rows = append(rows, TreeEntry{Mode: rec.Mode, Name: name, OID: rec.OID})
+	var emitTree func(n *treeBuilderNode) string
+	emitTree = func(n *treeBuilderNode) string {
+		var rows []TreeRow
+		for name, entry := range n.leafFiles {
+			rows = append(rows, TreeRow{Mode: entry.Mode, Name: name, OID: entry.OID})
 		}
-		for name, child := range n.dirs {
-			rows = append(rows, TreeEntry{Mode: "40000", Name: name, OID: emit(child)})
+		for name, child := range n.subDirs {
+			rows = append(rows, TreeRow{Mode: "40000", Name: name, OID: emitTree(child)})
 		}
-		return v.PutObject(ObjTree, BuildTree(rows))
+		return d.StoreObject(KindTree, SerializeTree(rows))
 	}
-	return emit(root)
+	return emitTree(root)
 }
 
-// PathAt resolves a repo-relative path at a commit; "" names the root.
-func (v *Vault) PathAt(commitOID, path string) *PathHit {
-	commitObj := v.Objects[commitOID]
-	if commitObj == nil || commitObj.Type != ObjCommit {
+// ResolvePath resolves a repository-relative path at a commit; the
+// empty path names the root directory.
+func (d *Depot) ResolvePath(commitOID, path string) *PathMatch {
+	commitObj := d.ObjectMap[commitOID]
+	if commitObj == nil || commitObj.Kind != KindCommit {
 		return nil
 	}
-	treeOID := ParseCommit(commitObj.Data).Tree
+	rootTree := DecodeCommit(commitObj.Raw).TreeOID
 	if path == "" {
-		treeObj := v.Objects[treeOID]
+		treeObj := d.ObjectMap[rootTree]
 		if treeObj == nil {
 			return nil
 		}
-		return &PathHit{Kind: "dir", Entries: ParseTree(treeObj.Data)}
+		return &PathMatch{Kind: "dir", Entries: SplitTreeBytes(treeObj.Raw)}
 	}
-	parts := strings.Split(path, "/")
-	curTree := treeOID
-	for i, seg := range parts {
-		treeObj := v.Objects[curTree]
-		if treeObj == nil || treeObj.Type != ObjTree {
+	segments := strings.Split(path, "/")
+	currentTree := rootTree
+	for i, seg := range segments {
+		treeObj := d.ObjectMap[currentTree]
+		if treeObj == nil || treeObj.Kind != KindTree {
 			return nil
 		}
-		var row *TreeEntry
-		for _, e := range ParseTree(treeObj.Data) {
-			if e.Name == seg {
-				c := e
-				row = &c
+		var hit *TreeRow
+		for _, row := range SplitTreeBytes(treeObj.Raw) {
+			if row.Name == seg {
+				candidate := row
+				hit = &candidate
 				break
 			}
 		}
-		if row == nil {
+		if hit == nil {
 			return nil
 		}
-		last := i == len(parts)-1
-		if !last {
-			if row.Mode != "40000" && row.Mode != "040000" {
+		isLast := i == len(segments)-1
+		if !isLast {
+			if hit.Mode != "40000" && hit.Mode != "040000" {
 				return nil
 			}
-			curTree = row.OID
+			currentTree = hit.OID
 			continue
 		}
-		if row.Mode == "40000" || row.Mode == "040000" {
-			sub := v.Objects[row.OID]
+		if hit.Mode == "40000" || hit.Mode == "040000" {
+			sub := d.ObjectMap[hit.OID]
 			if sub == nil {
 				return nil
 			}
-			return &PathHit{Kind: "dir", Entries: ParseTree(sub.Data)}
+			return &PathMatch{Kind: "dir", Entries: SplitTreeBytes(sub.Raw)}
 		}
-		blob := v.Objects[row.OID]
+		blob := d.ObjectMap[hit.OID]
 		if blob == nil {
 			return nil
 		}
-		return &PathHit{Kind: "file", OID: row.OID, Data: blob.Data, Mode: row.Mode}
+		return &PathMatch{Kind: "file", OID: hit.OID, Raw: blob.Raw, Mode: hit.Mode}
 	}
 	return nil
 }
 
-// MakeCommit creates a commit object with the forge's deterministic
-// identity line.
-func (v *Vault) MakeCommit(treeOID string, parents []string, message string, seq int64) string {
-	stamp := v.EpochAt(seq)
+// MintCommit creates a commit object carrying the forge's
+// deterministic identity line.
+func (d *Depot) MintCommit(treeOID string, parents []string, message string, seq int64) string {
+	stamp := d.EpochForSeq(seq)
 	ident := "Forge <forge@example.invalid> " + strconv.FormatInt(stamp, 10) + " +0000"
-	var lines []string
-	lines = append(lines, "tree "+treeOID)
-	for _, p := range parents {
-		lines = append(lines, "parent "+p)
+	var headerLines []string
+	headerLines = append(headerLines, "tree "+treeOID)
+	for _, parent := range parents {
+		headerLines = append(headerLines, "parent "+parent)
 	}
-	lines = append(lines, "author "+ident, "committer "+ident)
-	body := strings.Join(lines, "\n") + "\n\n" + message
-	return v.PutObject(ObjCommit, []byte(body))
+	headerLines = append(headerLines, "author "+ident, "committer "+ident)
+	text := strings.Join(headerLines, "\n") + "\n\n" + message
+	return d.StoreObject(KindCommit, []byte(text))
 }
 
 // ---------------------------------------------------------------------------
 // Repositories
 // ---------------------------------------------------------------------------
 
-func (v *Vault) CreateRepo(name, description string, private bool) *Repo {
-	v.nextRepoID++
-	r := &Repo{
-		ID:            v.nextRepoID,
+// OpenRepository creates an empty repository record.
+func (d *Depot) OpenRepository(name, description string, private bool) *Repository {
+	d.repoSeq++
+	repo := &Repository{
+		ID:            d.repoSeq,
 		Name:          name,
 		Description:   description,
 		Private:       private,
 		DefaultBranch: "main",
 		Refs:          map[string]string{},
-		Labels:        map[string]*LabelRec{},
-		Issues:        map[int]*IssueRec{},
-		Pulls:         map[int]*PullRec{},
+		Labels:        map[string]*LabelRecord{},
+		Issues:        map[int]*IssueRecord{},
+		Pulls:         map[int]*PullRecord{},
 		NextNumber:    1,
-		Seq:           v.Seq(),
+		SeqNo:         d.NextSeq(),
 	}
-	v.Repos[name] = r
-	return r
+	d.RepoMap[name] = repo
+	return repo
 }
 
-// HeadRef is the ref the repository's HEAD names.
-func (v *Vault) HeadRef(r *Repo) string { return "refs/heads/" + r.DefaultBranch }
+// HeadRefName is the full ref the repository's HEAD names.
+func (d *Depot) HeadRefName(repo *Repository) string {
+	return "refs/heads/" + repo.DefaultBranch
+}
 
-// BranchTip returns the commit a branch name (or full ref) points at.
-func (v *Vault) BranchTip(r *Repo, branch string) (string, bool) {
+// BranchTipOID returns the commit a branch name (or full ref) points
+// at.
+func (d *Depot) BranchTipOID(repo *Repository, branch string) (string, bool) {
 	full := branch
 	if !strings.HasPrefix(branch, "refs/") {
 		full = "refs/heads/" + branch
 	}
-	oid, ok := r.Refs[full]
+	oid, ok := repo.Refs[full]
 	return oid, ok
 }
 
-// ResolveCommit resolves a ref-ish (branch, full ref, or commit oid) to a
-// commit oid.
-func (v *Vault) ResolveCommit(r *Repo, refish string) (string, bool) {
-	if tip, ok := v.BranchTip(r, refish); ok {
-		return v.PeelToCommit(tip)
+// ResolveToCommit resolves a ref-ish string (branch, full ref or
+// object id) to a commit id.
+func (d *Depot) ResolveToCommit(repo *Repository, refish string) (string, bool) {
+	if tip, ok := d.BranchTipOID(repo, refish); ok {
+		return d.FollowToCommit(tip)
 	}
-	obj := v.Objects[refish]
+	obj := d.ObjectMap[refish]
 	if obj == nil {
 		return "", false
 	}
-	if obj.Type == ObjCommit {
+	switch obj.Kind {
+	case KindCommit:
 		return refish, true
-	}
-	if obj.Type == ObjTag {
-		return v.PeelToCommit(refish)
+	case KindTag:
+		return d.FollowToCommit(refish)
 	}
 	return "", false
 }
 
-type WriteOutcome struct {
+// WriteResult reports the outcome of a file write.
+type WriteResult struct {
 	OK     bool
 	Status int
 	Prob   string
 	Commit string
-	Blob   string // "" when the write deleted the file
+	Blob   string // empty when the write deleted the file
 }
 
-// WriteFile writes (or, with content nil, deletes) a file on a branch,
-// committing on top of the branch tip. It creates the branch when the
-// repository is still unborn or when the branch is missing and the
+// WritePath writes a file on a branch (or deletes it, when content is
+// nil), committing on top of the branch tip. The branch is created
+// when the repository is still unborn, or when it is missing and the
 // repository has a default tip to start from.
-func (v *Vault) WriteFile(r *Repo, branch, path string, content []byte, message string, expectedSHA string, hasSHA bool) WriteOutcome {
+func (d *Depot) WritePath(repo *Repository, branch, path string, content []byte, message string, expectedSHA string, hasSHA bool) WriteResult {
 	fullRef := "refs/heads/" + branch
-	tip, hasTip := r.Refs[fullRef]
+	tip, hasTip := repo.Refs[fullRef]
 	if !hasTip {
-		if fb, ok := r.Refs[v.HeadRef(r)]; ok && fullRef != v.HeadRef(r) {
-			tip, hasTip = fb, true
+		if fallback, ok := repo.Refs[d.HeadRefName(repo)]; ok && fullRef != d.HeadRefName(repo) {
+			tip, hasTip = fallback, true
 		}
 	}
-	var base string
+	var baseCommit string
 	var baseOK bool
 	if hasTip {
-		base, baseOK = v.PeelToCommit(tip)
+		baseCommit, baseOK = d.FollowToCommit(tip)
 	}
-	flat := map[string]struct {
-		OID  string
-		Mode string
-	}{}
+	flat := FileMap{}
 	if baseOK {
-		flat = v.CommitFiles(base)
+		flat = d.FlattenCommit(baseCommit)
 	}
-	prior, priorOK := flat[path]
+	prior, priorKnown := flat[path]
 	if content == nil {
-		if !priorOK {
-			return WriteOutcome{OK: false, Status: 404, Prob: "Not Found"}
+		if !priorKnown {
+			return WriteResult{OK: false, Status: 404, Prob: "Not Found"}
 		}
 		if hasSHA && expectedSHA != prior.OID {
-			return WriteOutcome{OK: false, Status: 409, Prob: "Conflict: the file has changed since the given sha"}
+			return WriteResult{OK: false, Status: 409, Prob: "Conflict: the file has changed since the given sha"}
 		}
 		delete(flat, path)
-		treeOID := v.TreeFromFiles(flat)
+		newTree := d.BuildTreeFromFiles(flat)
 		var parents []string
 		if baseOK {
-			parents = []string{base}
+			parents = []string{baseCommit}
 		}
-		commitOID := v.MakeCommit(treeOID, parents, message, v.Seq())
-		r.Refs[fullRef] = commitOID
-		return WriteOutcome{OK: true, Commit: commitOID}
+		commitOID := d.MintCommit(newTree, parents, message, d.NextSeq())
+		repo.Refs[fullRef] = commitOID
+		return WriteResult{OK: true, Commit: commitOID}
 	}
-	if priorOK && hasSHA && expectedSHA != prior.OID {
-		return WriteOutcome{OK: false, Status: 409, Prob: "Conflict: the file has changed since the given sha"}
+	if priorKnown && hasSHA && expectedSHA != prior.OID {
+		return WriteResult{OK: false, Status: 409, Prob: "Conflict: the file has changed since the given sha"}
 	}
-	if !priorOK && hasSHA {
-		return WriteOutcome{OK: false, Status: 422, Prob: "Invalid request: sha supplied for a file that does not exist"}
+	if !priorKnown && hasSHA {
+		return WriteResult{OK: false, Status: 422, Prob: "Invalid request: sha supplied for a file that does not exist"}
 	}
-	blobOID := v.PutObject(ObjBlob, content)
+	blobOID := d.StoreObject(KindBlob, content)
 	mode := "100644"
-	if priorOK {
+	if priorKnown {
 		mode = prior.Mode
 	}
-	flat[path] = struct {
-		OID  string
-		Mode string
-	}{blobOID, mode}
-	treeOID := v.TreeFromFiles(flat)
+	flat[path] = FileEntry{OID: blobOID, Mode: mode}
+	newTree := d.BuildTreeFromFiles(flat)
 	var parents []string
 	if baseOK {
-		parents = []string{base}
+		parents = []string{baseCommit}
 	}
-	commitOID := v.MakeCommit(treeOID, parents, message, v.Seq())
-	r.Refs[fullRef] = commitOID
-	return WriteOutcome{OK: true, Commit: commitOID, Blob: blobOID}
+	commitOID := d.MintCommit(newTree, parents, message, d.NextSeq())
+	repo.Refs[fullRef] = commitOID
+	return WriteResult{OK: true, Commit: commitOID, Blob: blobOID}
 }
 
-// FileExists reports whether a branch holds a file at a path.
-func (v *Vault) FileExists(r *Repo, branch, path string) bool {
-	tip, ok := v.BranchTip(r, branch)
+// PathIsFile reports whether a branch holds a file at a path.
+func (d *Depot) PathIsFile(repo *Repository, branch, path string) bool {
+	tip, ok := d.BranchTipOID(repo, branch)
 	if !ok {
 		return false
 	}
-	commit, ok := v.PeelToCommit(tip)
+	commit, ok := d.FollowToCommit(tip)
 	if !ok {
 		return false
 	}
-	hit := v.PathAt(commit, path)
-	return hit != nil && hit.Kind == "file"
+	match := d.ResolvePath(commit, path)
+	return match != nil && match.Kind == "file"
 }
 
 // ---------------------------------------------------------------------------
 // Issues and pull requests
 // ---------------------------------------------------------------------------
 
-func (v *Vault) AddIssue(r *Repo, title, body string, labels []string) *IssueRec {
-	num := r.NextNumber
-	r.NextNumber++
-	v.nextIssueID++
-	rec := &IssueRec{
-		Number: num,
-		ID:     v.nextIssueID,
-		Title:  title,
-		Body:   body,
-		State:  "open",
-		Labels: append([]string{}, labels...),
-		Seq:    v.Seq(),
+// OpenIssue files a new issue in a repository.
+func (d *Depot) OpenIssue(repo *Repository, title, body string, labels []string) *IssueRecord {
+	number := repo.NextNumber
+	repo.NextNumber++
+	d.issueSeq++
+	record := &IssueRecord{
+		Number:     number,
+		ID:         d.issueSeq,
+		Title:      title,
+		BodyText:   body,
+		State:      "open",
+		LabelNames: append([]string{}, labels...),
+		SeqNo:      d.NextSeq(),
 	}
-	r.Issues[num] = rec
-	return rec
+	repo.Issues[number] = record
+	return record
 }
 
-func (v *Vault) AddComment(target interface {
-	AppendComment(*CommentRec)
-}, body string) *CommentRec {
-	v.nextCmtID++
-	rec := &CommentRec{ID: v.nextCmtID, Body: body, Seq: v.Seq()}
-	target.AppendComment(rec)
-	return rec
+// commentSink is anything a comment can be appended to (an issue or a
+// pull request).
+type commentSink interface {
+	AppendComment(*CommentRecord)
 }
 
-func (i *IssueRec) AppendComment(c *CommentRec) { i.Comments = append(i.Comments, c) }
-func (p *PullRec) AppendComment(c *CommentRec)  { p.Comments = append(p.Comments, c) }
-
-type CreatePullOutcome struct {
-	OK    bool
-	Prob  string
-	Pull  *PullRec
+// PostComment appends a comment to its target and returns the record.
+func (d *Depot) PostComment(target commentSink, body string) *CommentRecord {
+	d.commentSeq++
+	record := &CommentRecord{ID: d.commentSeq, BodyText: body, SeqNo: d.NextSeq()}
+	target.AppendComment(record)
+	return record
 }
 
-func (v *Vault) CreatePull(r *Repo, title, body, head, base string) CreatePullOutcome {
+func (i *IssueRecord) AppendComment(c *CommentRecord) { i.Comments = append(i.Comments, c) }
+func (p *PullRecord) AppendComment(c *CommentRecord)  { p.Comments = append(p.Comments, c) }
+
+// CreatePullResult reports the outcome of opening a pull request.
+type CreatePullResult struct {
+	OK   bool
+	Prob string
+	Pull *PullRecord
+}
+
+// CreatePull opens a pull request between two branches, refusing a
+// duplicate of an already-open one for the same head and base.
+func (d *Depot) CreatePull(repo *Repository, title, body, head, base string) CreatePullResult {
 	headName := strings.TrimPrefix(head, "refs/heads/")
 	baseName := strings.TrimPrefix(base, "refs/heads/")
-	headOID, ok := v.BranchTip(r, headName)
+	headOID, ok := d.BranchTipOID(repo, headName)
 	if !ok {
-		return CreatePullOutcome{Prob: "head branch " + headName + " does not exist"}
+		return CreatePullResult{Prob: "head branch " + headName + " does not exist"}
 	}
-	baseOID, ok := v.BranchTip(r, baseName)
+	baseOID, ok := d.BranchTipOID(repo, baseName)
 	if !ok {
-		return CreatePullOutcome{Prob: "base branch " + baseName + " does not exist"}
+		return CreatePullResult{Prob: "base branch " + baseName + " does not exist"}
 	}
-	for _, ex := range r.Pulls {
-		if ex.State == "open" && ex.HeadRef == headName && ex.BaseRef == baseName {
-			return CreatePullOutcome{Prob: "a pull request already exists for " + headName + " into " + baseName}
+	for _, existing := range repo.Pulls {
+		if existing.State == "open" && existing.HeadRef == headName && existing.BaseRef == baseName {
+			return CreatePullResult{Prob: "a pull request already exists for " + headName + " into " + baseName}
 		}
 	}
-	num := r.NextNumber
-	r.NextNumber++
-	v.nextIssueID++
-	headCommit, _ := v.PeelToCommit(headOID)
-	baseCommit, _ := v.PeelToCommit(baseOID)
-	rec := &PullRec{
-		Number:  num,
-		ID:      v.nextIssueID,
-		Title:   title,
-		Body:    body,
-		State:   "open",
-		HeadRef: headName,
-		BaseRef: baseName,
-		HeadSHA: headCommit,
-		BaseSHA: baseCommit,
-		Seq:     v.Seq(),
+	number := repo.NextNumber
+	repo.NextNumber++
+	d.issueSeq++
+	headCommit, _ := d.FollowToCommit(headOID)
+	baseCommit, _ := d.FollowToCommit(baseOID)
+	record := &PullRecord{
+		Number:   number,
+		ID:       d.issueSeq,
+		Title:    title,
+		BodyText: body,
+		State:    "open",
+		HeadRef:  headName,
+		BaseRef:  baseName,
+		HeadSHA:  headCommit,
+		BaseSHA:  baseCommit,
+		SeqNo:    d.NextSeq(),
 	}
-	r.Pulls[num] = rec
-	return CreatePullOutcome{OK: true, Pull: rec}
+	repo.Pulls[number] = record
+	return CreatePullResult{OK: true, Pull: record}
 }
 
-type PullView struct {
-	Base       string
-	HeadCommit string
-	BaseCommit string
-	Conflict   bool
+// PullSummary is the live merge picture of a pull request.
+type PullSummary struct {
+	BaseOID    string
+	HeadOID    string
+	BaseTipOID string
+	Conflicted bool
 }
 
-// PullView returns the live merge picture of a pull request.
-func (v *Vault) PullView(r *Repo, p *PullRec) (PullView, bool) {
-	rawHead, ok := v.BranchTip(r, p.HeadRef)
+// SummarizePull computes a pull request's merge picture from the
+// branches as they stand now.
+func (d *Depot) SummarizePull(repo *Repository, pull *PullRecord) (PullSummary, bool) {
+	rawHead, ok := d.BranchTipOID(repo, pull.HeadRef)
 	if !ok {
-		return PullView{}, false
+		return PullSummary{}, false
 	}
-	rawBase, ok := v.BranchTip(r, p.BaseRef)
+	rawBase, ok := d.BranchTipOID(repo, pull.BaseRef)
 	if !ok {
-		return PullView{}, false
+		return PullSummary{}, false
 	}
-	headCommit, ok1 := v.PeelToCommit(rawHead)
-	baseCommit, ok2 := v.PeelToCommit(rawBase)
-	if !ok1 || !ok2 {
-		return PullView{}, false
+	headCommit, okHead := d.FollowToCommit(rawHead)
+	baseCommit, okBase := d.FollowToCommit(rawBase)
+	if !okHead || !okBase {
+		return PullSummary{}, false
 	}
-	common := v.MergeBase(headCommit, baseCommit)
+	common := d.CommonAncestor(headCommit, baseCommit)
 	if common == "" {
-		return PullView{Base: "", HeadCommit: headCommit, BaseCommit: baseCommit, Conflict: true}, true
+		return PullSummary{BaseOID: "", HeadOID: headCommit, BaseTipOID: baseCommit, Conflicted: true}, true
 	}
-	filesBase := v.CommitFiles(common)
-	filesHead := v.CommitFiles(headCommit)
-	filesTip := v.CommitFiles(baseCommit)
+	filesAtBase := d.FlattenCommit(common)
+	filesAtHead := d.FlattenCommit(headCommit)
+	filesAtTip := d.FlattenCommit(baseCommit)
+	paths := map[string]bool{}
+	for path := range filesAtBase {
+		paths[path] = true
+	}
+	for path := range filesAtHead {
+		paths[path] = true
+	}
+	for path := range filesAtTip {
+		paths[path] = true
+	}
 	conflict := false
-	all := map[string]bool{}
-	for k := range filesBase {
-		all[k] = true
-	}
-	for k := range filesHead {
-		all[k] = true
-	}
-	for k := range filesTip {
-		all[k] = true
-	}
-	for path := range all {
-		b, bOK := filesBase[path]
-		h, hOK := filesHead[path]
-		t, tOK := filesTip[path]
-		headMoved := !hOK || !bOK || h.OID != b.OID
-		if hOK && bOK && h.OID == b.OID {
-			headMoved = false
-		}
-		if !hOK && !bOK {
-			headMoved = false
-		}
-		baseMoved := !tOK || !bOK || t.OID != b.OID
-		if tOK && bOK && t.OID == b.OID {
-			baseMoved = false
-		}
-		if !tOK && !bOK {
-			baseMoved = false
-		}
-		_ = b
-		if headMoved && baseMoved {
-			hOID := ""
-			if hOK {
-				hOID = h.OID
+	for path := range paths {
+		baseEntry, inBase := filesAtBase[path]
+		headEntry, inHead := filesAtHead[path]
+		tipEntry, inTip := filesAtTip[path]
+		headMoved := inHead != inBase || (inHead && inBase && headEntry.OID != baseEntry.OID)
+		tipMoved := inTip != inBase || (inTip && inBase && tipEntry.OID != baseEntry.OID)
+		if headMoved && tipMoved {
+			headOID := ""
+			if inHead {
+				headOID = headEntry.OID
 			}
-			tOID := ""
-			if tOK {
-				tOID = t.OID
+			tipOID := ""
+			if inTip {
+				tipOID = tipEntry.OID
 			}
-			if hOID != tOID {
+			if headOID != tipOID {
 				conflict = true
 			}
 		}
 	}
-	return PullView{Base: common, HeadCommit: headCommit, BaseCommit: baseCommit, Conflict: conflict}, true
+	return PullSummary{BaseOID: common, HeadOID: headCommit, BaseTipOID: baseCommit, Conflicted: conflict}, true
 }
 
-type FileChange struct {
+// FileDelta is one file's change in a pull request.
+type FileDelta struct {
 	Path      string
 	Status    string
 	Additions int
 	Deletions int
 }
 
-// PullFiles lists the changed files of a pull request (merge-base -> head).
-func (v *Vault) PullFiles(r *Repo, p *PullRec) []FileChange {
-	headRaw, _ := v.BranchTip(r, p.HeadRef)
+// ChangedFiles lists a pull request's changed files, from its merge
+// base to its head.
+func (d *Depot) ChangedFiles(repo *Repository, pull *PullRecord) []FileDelta {
+	headRaw, _ := d.BranchTipOID(repo, pull.HeadRef)
 	if headRaw == "" {
-		headRaw = p.HeadSHA
+		headRaw = pull.HeadSHA
 	}
-	baseRaw, _ := v.BranchTip(r, p.BaseRef)
+	baseRaw, _ := d.BranchTipOID(repo, pull.BaseRef)
 	if baseRaw == "" {
-		baseRaw = p.BaseSHA
+		baseRaw = pull.BaseSHA
 	}
-	headOID, _ := v.PeelToCommit(headRaw)
-	baseOID, _ := v.PeelToCommit(baseRaw)
-	common := v.MergeBase(headOID, baseOID)
+	headOID, _ := d.FollowToCommit(headRaw)
+	baseOID, _ := d.FollowToCommit(baseRaw)
+	common := d.CommonAncestor(headOID, baseOID)
 	if common == "" {
 		common = baseOID
 	}
-	return DiffFiles(v, v.CommitFiles(common), v.CommitFiles(headOID))
+	return CompareFileMaps(d, d.FlattenCommit(common), d.FlattenCommit(headOID))
 }
 
-type MergeOutcome struct {
+// MergeResult reports the outcome of a merge attempt.
+type MergeResult struct {
 	OK     bool
 	Status int
 	Prob   string
 	SHA    string
 }
 
-// MergePull merges a pull request into its base branch: 'squash' lands one
-// commit with the head's changes, 'merge' a two-parent commit, 'rebase'
-// replays the head's own commits. A conflicted pull is refused with 405.
-func (v *Vault) MergePull(r *Repo, p *PullRec, method string) MergeOutcome {
-	if p.Merged {
-		return MergeOutcome{Status: 405, Prob: "Pull Request was already merged"}
+// MergePullRequest merges a pull request into its base branch:
+// "squash" lands a single commit holding the head's changes, "merge"
+// a two-parent commit, "rebase" a replay of the head's own commits. A
+// conflicted pull request is refused with status 405.
+func (d *Depot) MergePullRequest(repo *Repository, pull *PullRecord, method string) MergeResult {
+	if pull.Merged {
+		return MergeResult{Status: 405, Prob: "Pull Request was already merged"}
 	}
-	if p.State == "closed" {
-		return MergeOutcome{Status: 405, Prob: "Pull Request is closed"}
+	if pull.State == "closed" {
+		return MergeResult{Status: 405, Prob: "Pull Request is closed"}
 	}
-	view, ok := v.PullView(r, p)
+	summary, ok := d.SummarizePull(repo, pull)
 	if !ok {
-		return MergeOutcome{Status: 405, Prob: "Pull Request is not mergeable"}
+		return MergeResult{Status: 405, Prob: "Pull Request is not mergeable"}
 	}
-	if view.Conflict {
-		return MergeOutcome{Status: 405, Prob: "Pull Request is not mergeable: conflicts must be resolved first"}
+	if summary.Conflicted {
+		return MergeResult{Status: 405, Prob: "Pull Request is not mergeable: conflicts must be resolved first"}
 	}
-	filesBase := v.CommitFiles(view.Base)
-	filesHead := v.CommitFiles(view.HeadCommit)
-	combined := v.CommitFiles(view.BaseCommit)
-	// Apply the head's changes relative to the merge base onto the base tip.
-	for path, he := range filesHead {
-		be, inBase := filesBase[path]
-		if !inBase || he.OID != be.OID {
-			combined[path] = he
+	filesAtBase := d.FlattenCommit(summary.BaseOID)
+	filesAtHead := d.FlattenCommit(summary.HeadOID)
+	combined := d.FlattenCommit(summary.BaseTipOID)
+	// Lay the head's changes, measured against the merge base, over
+	// the base branch's tip.
+	for path, headEntry := range filesAtHead {
+		baseEntry, inBase := filesAtBase[path]
+		if !inBase || headEntry.OID != baseEntry.OID {
+			combined[path] = headEntry
 		}
 	}
-	for path := range filesBase {
-		if _, inHead := filesHead[path]; !inHead {
-			if ce, ok := combined[path]; ok && ce.OID == filesBase[path].OID {
+	for path := range filesAtBase {
+		if _, inHead := filesAtHead[path]; !inHead {
+			if current, ok := combined[path]; ok && current.OID == filesAtBase[path].OID {
 				delete(combined, path)
 			}
 		}
 	}
-	mergedTree := v.TreeFromFiles(combined)
+	mergedTree := d.BuildTreeFromFiles(combined)
 	var landed string
 	switch method {
 	case "merge":
-		landed = v.MakeCommit(mergedTree, []string{view.BaseCommit, view.HeadCommit}, "Merge pull request #"+strconv.Itoa(p.Number)+": "+p.Title, v.Seq())
+		landed = d.MintCommit(mergedTree, []string{summary.BaseTipOID, summary.HeadOID}, "Merge pull request #"+strconv.Itoa(pull.Number)+": "+pull.Title, d.NextSeq())
 	case "rebase":
 		var chain []string
-		seen := map[string]bool{}
-		var gather func(cur string)
-		gather = func(cur string) {
-			if cur == view.Base || seen[cur] {
+		marked := map[string]bool{}
+		var collect func(current string)
+		collect = func(current string) {
+			if current == summary.BaseOID || marked[current] {
 				return
 			}
-			obj := v.GetObject(cur)
-			if obj == nil || obj.Type != ObjCommit {
+			obj := d.FetchObject(current)
+			if obj == nil || obj.Kind != KindCommit {
 				return
 			}
-			seen[cur] = true
-			chain = append(chain, cur)
-			for _, par := range ParseCommit(obj.Data).Parents {
-				gather(par)
+			marked[current] = true
+			chain = append(chain, current)
+			for _, parent := range DecodeCommit(obj.Raw).ParentOIDs {
+				collect(parent)
 			}
 		}
-		gather(view.HeadCommit)
+		collect(summary.HeadOID)
 		for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
 			chain[i], chain[j] = chain[j], chain[i]
 		}
-		cursor := view.BaseCommit
-		landed = view.BaseCommit
+		cursor := summary.BaseTipOID
+		landed = summary.BaseTipOID
 		for _, oldOID := range chain {
-			oldInfo := ParseCommit(v.GetObject(oldOID).Data)
-			landed = v.MakeCommit(oldInfo.Tree, []string{cursor}, oldInfo.Message, v.Seq())
+			oldHead := DecodeCommit(d.FetchObject(oldOID).Raw)
+			landed = d.MintCommit(oldHead.TreeOID, []string{cursor}, oldHead.MessageBody, d.NextSeq())
 			cursor = landed
 		}
 		if len(chain) == 0 {
-			landed = v.MakeCommit(mergedTree, []string{view.BaseCommit}, p.Title, v.Seq())
+			landed = d.MintCommit(mergedTree, []string{summary.BaseTipOID}, pull.Title, d.NextSeq())
 		}
 	default: // squash
-		landed = v.MakeCommit(mergedTree, []string{view.BaseCommit}, p.Title, v.Seq())
+		landed = d.MintCommit(mergedTree, []string{summary.BaseTipOID}, pull.Title, d.NextSeq())
 	}
-	r.Refs["refs/heads/"+p.BaseRef] = landed
-	p.State = "closed"
-	p.Merged = true
-	p.MergeCommitSHA = landed
-	p.MergedSeq = v.Seq()
-	return MergeOutcome{OK: true, SHA: landed}
+	repo.Refs["refs/heads/"+pull.BaseRef] = landed
+	pull.State = "closed"
+	pull.Merged = true
+	pull.MergeCommitSHA = landed
+	pull.MergedSeq = d.NextSeq()
+	return MergeResult{OK: true, SHA: landed}
 }
 
-// CountLineDelta counts line additions/deletions between two file versions
-// (multi-set line difference).
-func CountLineDelta(oldData, newData []byte) (int, int) {
-	tally := func(data []byte) map[string]int {
-		counts := map[string]int{}
-		if data == nil {
-			return counts
+// LineDelta counts the line additions and deletions between two file
+// versions, as a multi-set difference over lines.
+func LineDelta(oldRaw, newRaw []byte) (int, int) {
+	countLines := func(raw []byte) map[string]int {
+		tally := map[string]int{}
+		if raw == nil {
+			return tally
 		}
-		for _, line := range strings.Split(string(data), "\n") {
-			counts[line]++
+		for _, line := range strings.Split(string(raw), "\n") {
+			tally[line]++
 		}
-		return counts
+		return tally
 	}
-	before := tally(oldData)
-	after := tally(newData)
+	before := countLines(oldRaw)
+	after := countLines(newRaw)
 	added, removed := 0, 0
 	for line, n := range after {
-		if d := n - before[line]; d > 0 {
-			added += d
+		if extra := n - before[line]; extra > 0 {
+			added += extra
 		}
 	}
 	for line, n := range before {
-		if d := n - after[line]; d > 0 {
-			removed += d
+		if extra := n - after[line]; extra > 0 {
+			removed += extra
 		}
 	}
 	return added, removed
 }
 
-// DiffFiles diffs two flattened file maps into the pull-request file list.
-func DiffFiles(v *Vault, before, after map[string]struct {
-	OID  string
-	Mode string
-}) []FileChange {
-	all := map[string]bool{}
-	for k := range before {
-		all[k] = true
+// CompareFileMaps diffs two flattened file maps into a pull request's
+// file list.
+func CompareFileMaps(d *Depot, before, after FileMap) []FileDelta {
+	union := map[string]bool{}
+	for path := range before {
+		union[path] = true
 	}
-	for k := range after {
-		all[k] = true
+	for path := range after {
+		union[path] = true
 	}
-	paths := make([]string, 0, len(all))
-	for k := range all {
-		paths = append(paths, k)
+	paths := make([]string, 0, len(union))
+	for path := range union {
+		paths = append(paths, path)
 	}
-	sortStrings(paths)
-	var rows []FileChange
+	sortLexical(paths)
+	var rows []FileDelta
 	for _, path := range paths {
-		b, bOK := before[path]
-		a, aOK := after[path]
-		if bOK && aOK && b.OID == a.OID {
+		beforeEntry, inBefore := before[path]
+		afterEntry, inAfter := after[path]
+		if inBefore && inAfter && beforeEntry.OID == afterEntry.OID {
 			continue
 		}
-		var oldData, newData []byte
-		if bOK {
-			if o := v.GetObject(b.OID); o != nil {
-				oldData = o.Data
+		var oldRaw, newRaw []byte
+		if inBefore {
+			if obj := d.FetchObject(beforeEntry.OID); obj != nil {
+				oldRaw = obj.Raw
 			}
 		}
-		if aOK {
-			if o := v.GetObject(a.OID); o != nil {
-				newData = o.Data
+		if inAfter {
+			if obj := d.FetchObject(afterEntry.OID); obj != nil {
+				newRaw = obj.Raw
 			}
 		}
-		add, del := CountLineDelta(oldData, newData)
+		additions, deletions := LineDelta(oldRaw, newRaw)
 		status := "modified"
-		if !bOK {
+		if !inBefore {
 			status = "added"
-		} else if !aOK {
+		} else if !inAfter {
 			status = "removed"
 		}
-		rows = append(rows, FileChange{Path: path, Status: status, Additions: add, Deletions: del})
+		rows = append(rows, FileDelta{Path: path, Status: status, Additions: additions, Deletions: deletions})
 	}
 	return rows
 }

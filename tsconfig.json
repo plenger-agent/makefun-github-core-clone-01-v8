@@ -1,1 +1,13 @@
-{"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"skipLibCheck":true,"strict":true,"target":"ES2022"},"include":["main.ts"]}
+{
+  // The entrypoint is one TypeScript file that Node 22 runs
+  // directly with type stripping; nothing is ever emitted.
+  "include": ["main.ts"],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  }
+}
